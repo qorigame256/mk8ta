@@ -21,6 +21,7 @@ function loadData() {
       if (d && Array.isArray(d.records)) {
         d.settings = Object.assign({ cc: "150", scope: "all", sort: "cup", pick: "random" }, d.settings);
         if (!d.targets || typeof d.targets !== "object") d.targets = {};
+        if (!d.targetLaps || typeof d.targetLaps !== "object") d.targetLaps = {};
         if (!Array.isArray(d.battles)) d.battles = [];
         return d;
       }
@@ -28,7 +29,7 @@ function loadData() {
   } catch (e) {
     console.error(e);
   }
-  return { version: 1, records: [], targets: {}, battles: [], settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
+  return { version: 1, records: [], targets: {}, targetLaps: {}, battles: [], settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
 }
 
 let data = loadData();
@@ -47,6 +48,25 @@ function save() {
 // 目標タイムはコース×排気量ごと。キーは "c01|150"
 function targetOf(courseId, cc) {
   return data.targets[`${courseId}|${cc}`] ?? null;
+}
+
+// 目標ラップ（任意）。目標タイムと同じキーで、値はラップの配列（途中の空欄は null）。無ければ null
+function targetLapsOf(courseId, cc) {
+  return data.targetLaps[`${courseId}|${cc}`] ?? null;
+}
+
+// ラップごとの目標との差。どちらかが空の周は「—」。比べられる周が1つも無ければ ""
+function lapGapText(laps, tLaps) {
+  if (!laps || !tLaps) return "";
+  const n = Math.max(laps.length, tLaps.length);
+  const parts = [];
+  let any = false;
+  for (let i = 0; i < n; i++) {
+    const a = laps[i], t = tLaps[i];
+    if (Number.isInteger(a) && Number.isInteger(t)) { parts.push(fmtDiff(a - t)); any = true; }
+    else parts.push("—");
+  }
+  return any ? parts.join(" / ") : "";
 }
 
 /* ---------- 対戦の評価 ---------- */
@@ -685,6 +705,7 @@ function renderCourse(courseId) {
   const best = bestOf(recs);
   const target = targetOf(courseId, cc);
   const gap = targetGap(best, target);
+  const tLaps = targetLapsOf(courseId, cc);
   const imp = improvements(recs);
 
   let html = images[courseId]
@@ -705,6 +726,8 @@ function renderCourse(courseId) {
     html += `<div class="big none">まだ記録がありません</div>`;
   }
   if (gap != null) html += `<div class="gap-big ${gap > 0 ? "" : "ok"}">${gapText(gap)}</div>`;
+  const pbLapGap = best ? lapGapText(best.laps, tLaps) : "";
+  if (pbLapGap) html += `<div class="sub lap-gap">ラップの目標との差：${pbLapGap}</div>`;
   html += `</div>`;
 
   html += `<div class="card target"><h2>${cc}cc 目標タイム</h2>
@@ -713,7 +736,12 @@ function renderCourse(courseId) {
       <button class="btn small" id="t-save" disabled>決定</button>
       ${target != null ? '<button class="btn small" id="t-clear">消す</button>' : ""}
     </div>
-    <p class="hint" id="t-hint">${target != null ? `いまの目標：${fmt(target)}` : "数字だけ入力（150000 → 1:50.000）"}</p></div>`;
+    <p class="hint" id="t-hint">${targetHintText(target, tLaps)}</p>
+    <details class="t-more" ${tLaps ? "open" : ""}><summary>詳細設定（目標ラップ・任意）</summary>
+      <div class="laps" id="t-laps">${targetLapSlots(tLaps).map((l, i) => lapInput(l, i)).join("")}</div>
+      <p class="hint" id="t-lap-hint">入れた周だけ目標になります。空欄のままでもかまいません</p>
+      <button type="button" class="btn small" id="t-add-lap" style="margin-top:8px">＋ ラップ欄を増やす</button>
+    </details></div>`;
 
   const bs = battleScore(courseId);
   if (bs) {
@@ -774,24 +802,66 @@ function renderCourse(courseId) {
   const $tIn = document.getElementById("t-in");
   const $tSave = document.getElementById("t-save");
   const $tHint = document.getElementById("t-hint");
-  $tIn.addEventListener("input", () => {
+  const $tLapHint = document.getElementById("t-lap-hint");
+  // 目標ラップの欄の値。空欄＝undefined、読めない＝null。後ろの空欄は除いて返す
+  const tLapValues = () => {
+    const v = [...document.querySelectorAll("#t-laps input")].map((i) => (i.value.trim() ? parseDigits(i.value) : undefined));
+    while (v.length && v[v.length - 1] === undefined) v.pop();
+    return v;
+  };
+  const tCheck = () => {
     const ms = parseDigits($tIn.value);
-    $tSave.disabled = ms == null || ms === target;
-    if (!$tIn.value.trim()) $tHint.textContent = target != null ? `いまの目標：${fmt(target)}` : "数字だけ入力（150000 → 1:50.000）";
+    const lv = tLapValues();
+    const lapBad = lv.some((x) => x === null);
+    const newLaps = lv.length ? lv.map((x) => (x === undefined ? null : x)) : null;
+    const lapsChanged = JSON.stringify(newLaps) !== JSON.stringify(tLaps);
+    $tSave.disabled = ms == null || lapBad || (ms === target && !lapsChanged);
+    if (!$tIn.value.trim()) $tHint.textContent = targetHintText(target, tLaps);
     else if (ms == null) $tHint.textContent = "読み取れません（分・秒2桁・1/1000秒3桁の順で数字を入力）";
     else $tHint.textContent = fmt(ms) + (best ? `　自己ベストとの差 ${fmtDiff(best.timeMs - ms)}` : "");
+    tLapCheck(ms, lv);
+  };
+  // 目標ラップの下の説明（合計と、目標タイムとの差）
+  const tLapCheck = (ms, lv) => {
+    const lapBad = lv.some((x) => x === null);
+    const filled = lv.filter((x) => typeof x === "number");
+    if (lapBad) {
+      $tLapHint.textContent = "読み取れないラップがあります";
+      $tLapHint.className = "hint err";
+    } else if (filled.length) {
+      const sum = filled.reduce((a, b) => a + b, 0);
+      $tLapHint.textContent = `ラップ合計 ${fmt(sum)}` + (ms != null && sum !== ms ? `（目標タイムとの差 ${fmtDiff(sum - ms)}）` : "")
+        + (ms == null ? "　※ 決定するには上の目標タイムも入れてください" : "");
+      $tLapHint.className = "hint";
+    } else {
+      $tLapHint.textContent = "入れた周だけ目標になります。空欄のままでもかまいません";
+      $tLapHint.className = "hint";
+    }
+  };
+  tLapCheck(target, tLapValues());
+  $tIn.addEventListener("input", tCheck);
+  document.getElementById("t-laps").addEventListener("input", tCheck);
+  document.getElementById("t-add-lap").addEventListener("click", () => {
+    const box = document.getElementById("t-laps");
+    box.insertAdjacentHTML("beforeend", lapInput(null, box.children.length));
   });
   $tSave.addEventListener("click", () => {
     const ms = parseDigits($tIn.value);
-    if (ms == null) return;
-    data.targets[`${courseId}|${cc}`] = ms;
+    const lv = tLapValues();
+    if (ms == null || lv.some((x) => x === null)) return;
+    const key = `${courseId}|${cc}`;
+    data.targets[key] = ms;
+    // 目標ラップは入力があったときだけ持つ。全部空なら持たない
+    if (lv.length) data.targetLaps[key] = lv.map((x) => (x === undefined ? null : x));
+    else delete data.targetLaps[key];
     save();
-    toast(`目標を ${fmt(ms)} にしました`);
+    toast(`目標を ${fmt(ms)} にしました` + (lv.length ? "（ラップも）" : ""));
     renderCourse(courseId);
   });
   const $tClear = document.getElementById("t-clear");
   if ($tClear) $tClear.addEventListener("click", () => {
     delete data.targets[`${courseId}|${cc}`];
+    delete data.targetLaps[`${courseId}|${cc}`];
     save();
     toast("目標を消しました");
     renderCourse(courseId);
@@ -943,6 +1013,8 @@ function renderForm(courseId, recordId) {
     } else if (filled.length) {
       const sum = filled.reduce((a, b) => a + b, 0);
       $lapHint.textContent = `ラップ合計 ${fmt(sum)}` + (ms != null && sum !== ms ? `（タイムとの差 ${fmtDiff(sum - ms)}）` : "");
+      const lg = lapGapText(lv.map((v) => (typeof v === "number" ? v : null)), targetLapsOf(courseId, cc));
+      if (lg) $lapHint.textContent += `　目標ラップとの差：${lg}`;
       $lapHint.className = "hint";
     } else {
       $lapHint.textContent = "";
@@ -1000,6 +1072,21 @@ function renderForm(courseId, recordId) {
   }
 }
 
+// 目標タイムの下の説明。目標ラップがあれば並べて出す
+function targetHintText(target, tLaps) {
+  if (target == null) return "数字だけ入力（150000 → 1:50.000）";
+  let t = `いまの目標：${fmt(target)}`;
+  if (tLaps) t += `（ラップ ${tLaps.map((l) => (l == null ? "—" : fmtLap(l))).join(" / ")}）`;
+  return t;
+}
+
+// 目標ラップの入力欄に入れる値。最低3欄
+function targetLapSlots(tLaps) {
+  const slots = (tLaps || []).slice();
+  while (slots.length < 3) slots.push(null);
+  return slots;
+}
+
 function lapInput(ms, i) {
   return `<input class="input" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="${i + 1}周" value="${ms == null ? "" : toDigits(ms)}">`;
 }
@@ -1019,7 +1106,7 @@ function renderSettings() {
       <button class="btn primary" id="export">記録を書き出す</button>
       <button class="btn" id="import">書き出したファイルを読み込む</button>
       <input type="file" id="import-file" accept=".json,application/json" hidden>
-      <p class="hint">目標タイム・コース画像・対戦の評価も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像は、まだ無いコースにだけ入ります）。</p>
+      <p class="hint">目標タイム（目標ラップを含む）・コース画像・対戦の評価も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像は、まだ無いコースにだけ入ります）。</p>
     </div>
     <div class="card"><h2>保存の状態</h2><p id="persist">確認中…</p></div>
     <div class="card"><h2>全コースの記録をリセット</h2>
@@ -1061,7 +1148,7 @@ function renderSettings() {
 async function exportData() {
   const payload = JSON.stringify({
     app: "mk8ta", version: 1, exportedAt: new Date().toISOString(),
-    records: data.records, targets: data.targets, battles: data.battles, images,
+    records: data.records, targets: data.targets, targetLaps: data.targetLaps, battles: data.battles, images,
   }, null, 1);
   const name = `マリカTA記録_${today()}.json`;
   const file = new File([payload], name, { type: "application/json" });
@@ -1135,6 +1222,14 @@ function importData(file) {
         const [cid, tcc] = k.split("|");
         if (!COURSE_BY_ID[cid] || (tcc !== "150" && tcc !== "200") || !Number.isInteger(v) || v <= 0) continue;
         if (data.targets[k] == null) { data.targets[k] = v; tAdded++; }
+      }
+    }
+    // 目標ラップも、まだ無いものだけ入れる（ファイルと今の目標タイムが同じものに限る。別の目標にラップだけ付くのを防ぐ）
+    if (d.targetLaps && typeof d.targetLaps === "object" && d.targets && typeof d.targets === "object") {
+      for (const [k, v] of Object.entries(d.targetLaps)) {
+        if (data.targets[k] == null || data.targets[k] !== d.targets[k] || data.targetLaps[k] != null) continue;
+        if (!Array.isArray(v) || !v.length || !v.some((x) => Number.isInteger(x) && x > 0)) continue;
+        data.targetLaps[k] = v.map((x) => (Number.isInteger(x) && x > 0 ? x : null));
       }
     }
     save();

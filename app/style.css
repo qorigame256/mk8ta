@@ -215,3 +215,7 @@ main { padding: 12px 16px 96px; max-width: 640px; margin: 0 auto; }
 .rate-btns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .rate { border: none; border-radius: 12px; padding: 18px 0; font-size: 18px; font-weight: 800; }
 .rate.rt-normal { border: 1px solid var(--line); color: var(--text); }
+.t-more { margin-top: 10px; }
+.t-more summary { color: var(--muted); font-size: 13px; cursor: pointer; padding: 6px 2px; }
+.t-more .laps { margin-top: 6px; }
+.pb-card .lap-gap { font-variant-numeric: tabular-nums; }
