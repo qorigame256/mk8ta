@@ -4,12 +4,6 @@
 
 const STORE_KEY = "mk8ta.v1";
 const PLATFORMS = ["SFC", "N64", "GBA", "GC", "DS", "Wii", "3DS", "Tour"];
-const COMBO_FIELDS = [
-  ["driver", "キャラ"],
-  ["body", "車体"],
-  ["tires", "タイヤ"],
-  ["glider", "グライダー"],
-];
 
 /* ---------- 保存 ---------- */
 
@@ -792,10 +786,7 @@ function renderCourse(courseId) {
   if (best) {
     html += `<div class="big">${fmt(best.timeMs)}</div>`;
     if (imp[best.id] != null) html += `<div class="up">前のベストから ${fmtDiff(imp[best.id])}</div>`;
-    html += `<div class="sub">${fmtDate(best.date)}`;
-    const combo = comboText(best);
-    if (combo) html += `<br>${esc(combo)}`;
-    html += `</div>`;
+    html += `<div class="sub">${fmtDate(best.date)}</div>`;
   } else {
     html += `<div class="big none">まだ記録がありません</div>`;
   }
@@ -826,7 +817,7 @@ function renderCourse(courseId) {
     html += `<div class="list">`;
     for (const r of recs.slice().reverse()) {
       const isBest = best && r.id === best.id;
-      const meta = [fmtDate(r.date), comboText(r), r.memo].filter(Boolean).join("　");
+      const meta = [fmtDate(r.date), r.memo].filter(Boolean).join("　");
       html += `<button class="row rec" data-id="${r.id}">
         <span class="name"><span class="time">${fmt(r.timeMs)}</span>${isBest ? '<span class="badge">PB</span>' : ""}${imp[r.id] != null ? `<span class="upd">更新 ${fmtDiff(imp[r.id])}</span>` : ""}
         <span class="meta">${esc(meta)}</span></span>
@@ -994,11 +985,6 @@ function renderCourseBattle(courseId) {
   }));
 }
 
-function comboText(r) {
-  const c = r.combo || {};
-  return COMBO_FIELDS.map(([k]) => c[k]).filter(Boolean).join(" / ");
-}
-
 // タイムの推移グラフ。灰色の点＝各記録、金色の線＝その時点までの自己ベスト
 // 目標タイムがあれば緑の点線で引く
 function chartSvg(recs, target) {
@@ -1048,17 +1034,9 @@ function renderForm(courseId, recordId) {
   $title.textContent = editing ? "記録を修正" : "記録を追加";
   $back.hidden = false;
 
-  // 新規のときは、前回入れた組み合わせを最初から入れておく
-  const last = data.records.slice().sort((a, b) => b.createdAt - a.createdAt)[0];
-  const src = editing || { cc: data.settings.cc, date: today(), combo: last ? last.combo : {}, laps: [], memo: "" };
+  const src = editing || { cc: data.settings.cc, date: today(), laps: [], memo: "" };
   const laps = (src.laps || []).slice();
   while (laps.length < 3) laps.push(null);
-
-  // 過去に入れた値を候補として出す
-  const datalists = COMBO_FIELDS.map(([k]) => {
-    const vals = [...new Set(data.records.map((r) => (r.combo || {})[k]).filter(Boolean))];
-    return `<datalist id="dl-${k}">${vals.map((v) => `<option value="${esc(v)}">`).join("")}</datalist>`;
-  }).join("");
 
   $view.innerHTML = `
     <div class="card" style="margin-top:4px"><h2>${courseLabel(course.name)}</h2><p>${esc(course.cup)}</p></div>
@@ -1069,17 +1047,13 @@ function renderForm(courseId, recordId) {
       </div></div>
     <div class="field"><label for="f-time">タイム（数字だけ入力）</label>
       <input id="f-time" class="input time-input" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="152345" value="${toDigits(src.timeMs)}">
-      <p class="hint time-hint" id="time-hint">例：152345 と打つと 1:52.345</p></div>
+      <p class="hint time-hint" id="time-hint">例：152345 と打つと 1:52.345。空欄でもラップを3つ以上入れれば合計がタイムになります</p></div>
     <div class="field"><div class="label">ラップ（任意・数字だけ。37123 → 37.123）</div>
       <div class="laps" id="laps">${laps.map((l, i) => lapInput(l, i)).join("")}</div>
       <p class="hint" id="lap-hint"></p>
       <button type="button" class="btn small" id="add-lap" style="margin-top:8px">＋ ラップ欄を増やす</button></div>
     <div class="field"><label for="f-date">日付</label>
       <input id="f-date" class="input" type="date" value="${esc(src.date)}"></div>
-    <div class="field"><div class="label">組み合わせ（任意）</div>
-      <div class="grid2">${COMBO_FIELDS.map(([k, label]) =>
-        `<input class="input" id="f-${k}" list="dl-${k}" placeholder="${label}" autocomplete="off" value="${esc((src.combo || {})[k])}">`).join("")}</div>
-      ${datalists}</div>
     <div class="field"><label for="f-memo">メモ（任意）</label>
       <textarea id="f-memo" class="input" rows="3">${esc(src.memo)}</textarea></div>
     <button class="btn primary" id="save" disabled>保存</button>
@@ -1103,11 +1077,21 @@ function renderForm(courseId, recordId) {
   function lapValues() {
     return [...document.querySelectorAll("#laps input")].map((i) => (i.value.trim() ? parseDigits(i.value) : undefined));
   }
+  // タイムが空欄で、1周目から3周以上ラップが埋まっているときは、その合計をタイムにする（目標タイムと同じ決まり）
+  function timeMs(lv) {
+    if ($time.value.trim()) return parseDigits($time.value);
+    const filled = lv.slice();
+    while (filled.length && filled[filled.length - 1] === undefined) filled.pop();
+    return filled.length >= 3 && filled.every((v) => typeof v === "number") ? filled.reduce((a, b) => a + b, 0) : null;
+  }
 
   function check() {
-    const ms = parseDigits($time.value);
+    const lv = lapValues();
+    const ms = timeMs(lv);
     if (!$time.value.trim()) {
-      $hint.textContent = "例：152345 と打つと 1:52.345";
+      $hint.textContent = ms != null
+        ? `空欄なので、保存するとラップ合計 ${fmt(ms)} がタイムになります`
+        : "例：152345 と打つと 1:52.345。空欄でもラップを3つ以上入れれば合計がタイムになります";
       $hint.className = "hint time-hint";
     } else if (ms == null) {
       $hint.textContent = "読み取れません（分・秒2桁・1/1000秒3桁の順で数字を入力）";
@@ -1119,7 +1103,6 @@ function renderForm(courseId, recordId) {
       $hint.textContent = fmt(ms) + (b ? `　自己ベスト ${fmt(b.timeMs)} との差 ${fmtDiff(ms - b.timeMs)}` : "");
       $hint.className = "hint time-hint";
     }
-    const lv = lapValues();
     const lapBad = lv.some((v) => v === null);
     const filled = lv.filter((v) => typeof v === "number");
     if (lapBad) {
@@ -1127,7 +1110,8 @@ function renderForm(courseId, recordId) {
       $lapHint.className = "hint err";
     } else if (filled.length) {
       const sum = filled.reduce((a, b) => a + b, 0);
-      $lapHint.textContent = `ラップ合計 ${fmt(sum)}` + (ms != null && sum !== ms ? `（タイムとの差 ${fmtDiff(sum - ms)}）` : "");
+      $lapHint.textContent = `ラップ合計 ${fmt(sum)}` + (ms != null && sum !== ms ? `（タイムとの差 ${fmtDiff(sum - ms)}）` : "")
+        + (ms == null && !$time.value.trim() ? "　※ 保存するにはタイムを入れるか、1周目から3周以上のラップを入れてください" : "");
       const lg = lapGapText(lv.map((v) => (typeof v === "number" ? v : null)), targetLapsOf(courseId, cc));
       if (lg) $lapHint.textContent += `　目標ラップとの差：${lg}`;
       $lapHint.className = "hint";
@@ -1147,9 +1131,9 @@ function renderForm(courseId, recordId) {
   if (!editing) $time.focus();
 
   $save.addEventListener("click", () => {
-    const ms = parseDigits($time.value);
-    if (ms == null) return;
     const lv = lapValues();
+    const ms = timeMs(lv);
+    if (ms == null || lv.some((v) => v === null)) return;
     while (lv.length && lv[lv.length - 1] === undefined) lv.pop(); // 後ろの空欄は捨てる
     const rec = {
       id: editing ? editing.id : newId(),
@@ -1158,7 +1142,7 @@ function renderForm(courseId, recordId) {
       timeMs: ms,
       date: document.getElementById("f-date").value || today(),
       laps: lv.map((v) => (typeof v === "number" ? v : null)),
-      combo: Object.fromEntries(COMBO_FIELDS.map(([k]) => [k, document.getElementById(`f-${k}`).value.trim()]).filter(([, v]) => v)),
+      ...(editing && editing.combo ? { combo: editing.combo } : {}), // 廃止前に入れた組み合わせは消さずに持っておく（表示はしない）
       memo: document.getElementById("f-memo").value.trim(),
       createdAt: editing ? editing.createdAt : Date.now(),
     };
@@ -1309,7 +1293,7 @@ function importData(file) {
       data.records.push({
         id: r.id, courseId: r.courseId, cc: r.cc, timeMs: r.timeMs, date: r.date,
         laps: Array.isArray(r.laps) ? r.laps.map((v) => (Number.isInteger(v) ? v : null)) : [],
-        combo: r.combo && typeof r.combo === "object" ? r.combo : {},
+        ...(r.combo && typeof r.combo === "object" ? { combo: r.combo } : {}), // 廃止前の組み合わせ。消さずに持つだけ
         memo: typeof r.memo === "string" ? r.memo : "",
         createdAt: Number(r.createdAt) || Date.now(),
       });
