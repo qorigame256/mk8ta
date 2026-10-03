@@ -19,7 +19,7 @@ function loadData() {
     if (raw) {
       const d = JSON.parse(raw);
       if (d && Array.isArray(d.records)) {
-        d.settings = Object.assign({ cc: "150", scope: "all", sort: "cup" }, d.settings);
+        d.settings = Object.assign({ cc: "150", scope: "all", sort: "cup", pick: "random" }, d.settings);
         if (!d.targets || typeof d.targets !== "object") d.targets = {};
         return d;
       }
@@ -27,7 +27,7 @@ function loadData() {
   } catch (e) {
     console.error(e);
   }
-  return { version: 1, records: [], targets: {}, settings: { cc: "150", scope: "all", sort: "cup" } };
+  return { version: 1, records: [], targets: {}, settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
 }
 
 let data = loadData();
@@ -275,6 +275,7 @@ function renderHome() {
   const sort = data.settings.sort; // cup / target
 
   $view.innerHTML = `<div class="toolbar">${ccSwitch()}</div>
+    <button class="btn pick-btn" id="pick-btn">🎲 おまかせで次のコースを決める</button>
     <div class="toolbar"><div class="seg" id="scope-seg">
       <button data-v="all" class="${scope === "all" ? "on" : ""}">すべて</button>
       <button data-v="done" class="${scope === "done" ? "on" : ""}">記録あり</button>
@@ -288,6 +289,10 @@ function renderHome() {
     <div id="home-list"></div>`;
 
   bindCcSwitch(renderHome);
+  document.getElementById("pick-btn").addEventListener("click", () => {
+    pickedId = null; // 一覧から入るたびに新しく選ぶ
+    go("#/pick");
+  });
   for (const [id, key] of [["scope-seg", "scope"], ["sort-seg", "sort"]]) {
     document.querySelectorAll(`#${id} button`).forEach((b) =>
       b.addEventListener("click", () => {
@@ -356,6 +361,109 @@ function renderHomeList() {
   const $list = document.getElementById("home-list");
   $list.innerHTML = html;
   $list.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => go(`#/course/${r.dataset.id}`)));
+}
+
+/* ---------- 画面：おまかせ ---------- */
+// 選び方に応じて「出やすさ（重み）」を付け、重みに比例した確率で1コースを引く。
+// 対象は絞り込み・検索に関係なく全96コース（目標の2つは「目標あり・未達成」のコースだけ）。
+
+const PICK_MODES = [
+  ["random", "ランダム", "全コースから同じ確率で選びます"],
+  ["stale", "久しぶり", "未記録・しばらく記録していないコースほど出やすくなります"],
+  ["near", "目標に近い", "目標まであと少しのコースほど出やすくなります（目標を達成したコースは出ません）"],
+  ["far", "目標に遠い", "目標まで遠いコースほど出やすくなります（目標を達成したコースは出ません）"],
+];
+
+let pickedId = null; // いま表示中のおまかせ結果（コース画面から戻ったときに引き直さないため）
+
+function daysSince(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const now = new Date();
+  return Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) - new Date(y, m - 1, d)) / 86400000);
+}
+
+// [{ c: コース, w: 重み }] を返す。重み0以下のコースは入れない
+function pickCandidates(mode, cc) {
+  const out = [];
+  for (const c of COURSES) {
+    const recs = recordsOf(c.id, cc);
+    let w = 1;
+    if (mode === "stale") {
+      // 未記録＝61、記録あり＝最後の記録からの日数＋1（60日で頭打ち）
+      const last = recs.reduce((a, r) => (!a || r.date > a ? r.date : a), null);
+      w = last ? Math.min(Math.max(daysSince(last), 0), 60) + 1 : 61;
+    } else if (mode === "near" || mode === "far") {
+      const gap = targetGap(bestOf(recs), targetOf(c.id, cc));
+      if (gap == null || gap <= 0) continue;
+      // 近い：差が小さいほど重い（0.5秒を足して極端な偏りを防ぐ）／遠い：差に比例
+      w = mode === "near" ? 1 / (gap + 500) : gap;
+    }
+    out.push({ c, w });
+  }
+  return out;
+}
+
+function pickOne(cands, avoidId) {
+  // 候補が2つ以上なら、直前に出たコースは避ける
+  const list = cands.length > 1 ? cands.filter((x) => x.c.id !== avoidId) : cands;
+  const total = list.reduce((s, x) => s + x.w, 0);
+  let r = Math.random() * total;
+  for (const x of list) if ((r -= x.w) < 0) return x.c.id;
+  return list.length ? list[list.length - 1].c.id : null;
+}
+
+function renderPick() {
+  $title.textContent = "おまかせ";
+  $back.hidden = false;
+  const cc = data.settings.cc;
+  const mode = data.settings.pick;
+  const cands = pickCandidates(mode, cc);
+  if (!pickedId || !cands.some((x) => x.c.id === pickedId)) pickedId = pickOne(cands, null);
+
+  let html = `<div class="toolbar">${ccSwitch()}</div>
+    <div class="toolbar"><div class="seg pick-seg" id="pick-seg">
+      ${PICK_MODES.map(([v, label]) => `<button data-v="${v}" class="${mode === v ? "on" : ""}">${label}</button>`).join("")}
+    </div></div>
+    <p class="summary">${PICK_MODES.find((m) => m[0] === mode)[2]}</p>`;
+
+  if (!pickedId) {
+    html += `<p class="empty">目標タイムを決めていて、まだ達成していない ${cc}cc のコースがありません。<br>コースの画面で目標タイムを入れると選べるようになります。</p>`;
+  } else {
+    const c = COURSE_BY_ID[pickedId];
+    const recs = recordsOf(c.id, cc);
+    const best = bestOf(recs);
+    const gap = targetGap(best, targetOf(c.id, cc));
+    const last = recs.reduce((a, r) => (!a || r.date > a ? r.date : a), null);
+    const ago = last ? daysSince(last) : null;
+    html += `<div class="pick-card">
+      ${images[c.id] ? `<img src="${images[c.id]}" alt="">` : ""}
+      <div class="cupname">${esc(c.cup)}</div>
+      <div class="cname">${courseLabel(c.name)}</div>
+      <div class="pb ${best ? "" : "none"}">${best ? `自己ベスト ${fmt(best.timeMs)}` : "まだ記録がありません"}</div>
+      ${gap != null ? `<div class="gap-big ${gap > 0 ? "" : "ok"}">${gapText(gap)}</div>` : ""}
+      ${last ? `<div class="sub">最後の記録 ${fmtDate(last)}（${ago <= 0 ? "今日" : `${ago}日前`}）・${recs.length}件</div>` : ""}
+    </div>
+    <button class="btn primary" id="pick-go">このコースへ</button>
+    <button class="btn" id="pick-again">🎲 もう一回</button>`;
+  }
+  $view.innerHTML = html;
+
+  bindCcSwitch(() => { pickedId = null; renderPick(); });
+  document.querySelectorAll("#pick-seg button").forEach((b) =>
+    b.addEventListener("click", () => {
+      data.settings.pick = b.dataset.v;
+      save();
+      pickedId = null;
+      renderPick();
+    })
+  );
+  if (pickedId) {
+    document.getElementById("pick-go").addEventListener("click", () => go(`#/course/${pickedId}`));
+    document.getElementById("pick-again").addEventListener("click", () => {
+      pickedId = pickOne(cands, pickedId);
+      renderPick();
+    });
+  }
 }
 
 /* ---------- 画面：コース詳細 ---------- */
@@ -823,6 +931,7 @@ function route() {
     case "add": return renderForm(parts[1], null);
     case "edit": return renderForm(null, parts[1]);
     case "settings": return renderSettings();
+    case "pick": return renderPick();
     default: return renderHome();
   }
 }
