@@ -878,14 +878,19 @@ function renderCourse(courseId) {
     while (v.length && v[v.length - 1] === undefined) v.pop();
     return v;
   };
+  // 目標タイムが空欄で、1周目から3周以上ラップが埋まっているときは、その合計を目標タイムにする
+  const tLapSum = (lv) => (lv.length >= 3 && lv.every((x) => typeof x === "number") ? lv.reduce((a, b) => a + b, 0) : null);
+  const tMs = (lv) => ($tIn.value.trim() ? parseDigits($tIn.value) : tLapSum(lv));
   const tCheck = () => {
-    const ms = parseDigits($tIn.value);
     const lv = tLapValues();
+    const ms = tMs(lv);
     const lapBad = lv.some((x) => x === null);
     const newLaps = lv.length ? lv.map((x) => (x === undefined ? null : x)) : null;
     const lapsChanged = JSON.stringify(newLaps) !== JSON.stringify(tLaps);
     $tSave.disabled = ms == null || lapBad || (ms === target && !lapsChanged);
-    if (!$tIn.value.trim()) $tHint.textContent = targetHintText(target, tLaps);
+    if (!$tIn.value.trim()) $tHint.textContent = ms != null && (ms !== target || lapsChanged)
+      ? `空欄なので、決定するとラップ合計 ${fmt(ms)} が目標タイムになります`
+      : targetHintText(target, tLaps);
     else if (ms == null) $tHint.textContent = "読み取れません（分・秒2桁・1/1000秒3桁の順で数字を入力）";
     else $tHint.textContent = fmt(ms) + (best ? `　自己ベストとの差 ${fmtDiff(best.timeMs - ms)}` : "");
     tLapCheck(ms, lv);
@@ -900,7 +905,7 @@ function renderCourse(courseId) {
     } else if (filled.length) {
       const sum = filled.reduce((a, b) => a + b, 0);
       $tLapHint.textContent = `ラップ合計 ${fmt(sum)}` + (ms != null && sum !== ms ? `（目標タイムとの差 ${fmtDiff(sum - ms)}）` : "")
-        + (ms == null ? "　※ 決定するには上の目標タイムも入れてください" : "");
+        + (ms == null ? "　※ 決定するには上の目標タイムを入れるか、1周目から3周以上のラップを入れてください" : "");
       $tLapHint.className = "hint";
     } else {
       $tLapHint.textContent = "入れた周だけ目標になります。空欄のままでもかまいません";
@@ -915,8 +920,8 @@ function renderCourse(courseId) {
     box.insertAdjacentHTML("beforeend", lapInput(null, box.children.length));
   });
   $tSave.addEventListener("click", () => {
-    const ms = parseDigits($tIn.value);
     const lv = tLapValues();
+    const ms = tMs(lv);
     if (ms == null || lv.some((x) => x === null)) return;
     const key = `${courseId}|${cc}`;
     data.targets[key] = ms;
