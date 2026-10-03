@@ -23,13 +23,14 @@ function loadData() {
         if (!d.targets || typeof d.targets !== "object") d.targets = {};
         if (!d.targetLaps || typeof d.targetLaps !== "object") d.targetLaps = {};
         if (!Array.isArray(d.battles)) d.battles = [];
+        if (!Array.isArray(d.pickExclude)) d.pickExclude = [];
         return d;
       }
     }
   } catch (e) {
     console.error(e);
   }
-  return { version: 1, records: [], targets: {}, targetLaps: {}, battles: [], settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
+  return { version: 1, records: [], targets: {}, targetLaps: {}, battles: [], pickExclude: [], settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
 }
 
 let data = loadData();
@@ -435,7 +436,7 @@ function renderHomeList() {
 /* ---------- 画面：おまかせ ---------- */
 // 選び方に応じて「出やすさ（重み）」を付け、重みに比例した確率で1コースを引く。
 // 対象は絞り込み・検索に関係なく全96コース（目標の2つは「目標あり・未達成」のコースだけ、
-// 対戦で苦手は「練習すべきコース」だけ）。
+// 対戦で苦手は「練習すべきコース」だけ）。除外したコース（data.pickExclude）はどの選び方でも出さない。
 
 const PICK_MODES = [
   ["random", "ランダム", "全コースから同じ確率で選びます"],
@@ -485,22 +486,30 @@ function pickOne(cands, avoidId) {
   return list.length ? list[list.length - 1].c.id : null;
 }
 
+function isExcluded(courseId) {
+  return data.pickExclude.includes(courseId);
+}
+
 function renderPick() {
   $title.textContent = "おまかせ";
   $back.hidden = false;
   const cc = data.settings.cc;
   const mode = data.settings.pick;
-  const cands = pickCandidates(mode, cc);
+  const raw = pickCandidates(mode, cc);
+  const cands = raw.filter((x) => !isExcluded(x.c.id));
   if (!pickedId || !cands.some((x) => x.c.id === pickedId)) pickedId = pickOne(cands, null);
 
   let html = `<div class="toolbar">${ccSwitch()}</div>
     <div class="toolbar"><div class="seg pick-seg" id="pick-seg">
       ${PICK_MODES.map(([v, label]) => `<button data-v="${v}" class="${mode === v ? "on" : ""}">${label}</button>`).join("")}
     </div></div>
-    <p class="summary">${PICK_MODES.find((m) => m[0] === mode)[2]}</p>`;
+    <p class="summary">${PICK_MODES.find((m) => m[0] === mode)[2]}</p>
+    <button class="btn pick-btn" id="pick-exclude">🚫 除外するコース（${data.pickExclude.length}）</button>`;
 
   if (!pickedId) {
-    html += mode === "weak"
+    html += raw.length
+      ? `<p class="empty">選べるコースがすべて除外されています。<br>「除外するコース」で戻すと選べるようになります。</p>`
+      : mode === "weak"
       ? `<p class="empty">対戦で練習すべきコースがありません。<br>対戦の記録で「悪い」が続いたコースが選ばれるようになります。</p>`
       : `<p class="empty">目標タイムを決めていて、まだ達成していない ${cc}cc のコースがありません。<br>コースの画面で目標タイムを入れると選べるようになります。</p>`;
   } else {
@@ -521,11 +530,13 @@ function renderPick() {
       ${bs ? `<div class="sub">対戦の評価（直近${bs.recent.length}回）${ratingChips(bs.recent)} 合計 ${scoreText(bs.score)}</div>` : ""}
     </div>
     <button class="btn primary" id="pick-go">このコースへ</button>
-    <button class="btn" id="pick-again">🎲 もう一回</button>`;
+    <button class="btn" id="pick-again">🎲 もう一回</button>
+    <button class="btn" id="pick-ex-one">🚫 このコースを除外</button>`;
   }
   $view.innerHTML = html;
 
   bindCcSwitch(() => { pickedId = null; renderPick(); });
+  document.getElementById("pick-exclude").addEventListener("click", () => go("#/exclude"));
   document.querySelectorAll("#pick-seg button").forEach((b) =>
     b.addEventListener("click", () => {
       data.settings.pick = b.dataset.v;
@@ -540,7 +551,70 @@ function renderPick() {
       pickedId = pickOne(cands, pickedId);
       renderPick();
     });
+    document.getElementById("pick-ex-one").addEventListener("click", () => {
+      const c = COURSE_BY_ID[pickedId];
+      data.pickExclude.push(c.id);
+      if (!save()) return;
+      toast(`${c.name} を除外しました`);
+      pickedId = null; // 除外したので引き直す
+      renderPick();
+    });
   }
+}
+
+/* ---------- 画面：おまかせで除外するコース ---------- */
+// 行をタップするたびに「除外する／しない」が切り替わり、その場で保存する。150cc・200cc 共通。
+
+let excludeSearch = "";
+
+function renderExclude() {
+  $title.textContent = "除外するコース";
+  $back.hidden = false;
+  $view.innerHTML = `<p class="summary">ここで除外したコースは、おまかせのどの選び方でも出なくなります（150cc・200cc 共通）。タップで切り替えます。</p>
+    <div class="search"><input id="ex-search" class="input" type="search" placeholder="コース名で検索" autocomplete="off" value="${esc(excludeSearch)}"></div>
+    <div id="ex-head"></div>
+    <div id="ex-list"></div>`;
+  document.getElementById("ex-search").addEventListener("input", (e) => {
+    excludeSearch = e.target.value;
+    renderExcludeList();
+  });
+  renderExcludeList();
+}
+
+function renderExcludeList() {
+  const n = data.pickExclude.length;
+  const $head = document.getElementById("ex-head");
+  $head.innerHTML = `<div class="toolbar"><span class="summary" style="flex:1;margin:0 2px">除外中 ${n}コース</span>
+    <button class="btn small" id="ex-clear" ${n ? "" : "disabled"}>すべて戻す</button></div>`;
+  document.getElementById("ex-clear").addEventListener("click", () => {
+    if (!confirm(`除外中の ${n}コースをすべて戻します。`)) return;
+    data.pickExclude = [];
+    save();
+    renderExcludeList();
+  });
+
+  const q = norm(excludeSearch);
+  const shown = COURSES.filter((c) => !q || norm(c.name).includes(q) || norm(c.cup).includes(q));
+  let html = "";
+  for (const cup of CUPS) {
+    const rows = shown.filter((c) => c.cup === cup.name);
+    if (!rows.length) continue;
+    html += `<section class="cup"><h2>${esc(cup.name)}${cup.dlc ? '<span class="dlc">追加</span>' : ""}</h2><div class="list">${rows.map((c) => {
+      const ex = isExcluded(c.id);
+      return `<button class="row ex-row ${ex ? "ex" : ""}" data-id="${c.id}">
+        <span class="name">${courseLabel(c.name)}</span>
+        <span class="ex-mark">${ex ? "除外中" : "対象"}</span></button>`;
+    }).join("")}</div></section>`;
+  }
+  if (!shown.length) html = `<p class="empty">見つかりません</p>`;
+  const $list = document.getElementById("ex-list");
+  $list.innerHTML = html;
+  $list.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => {
+    const id = r.dataset.id;
+    data.pickExclude = isExcluded(id) ? data.pickExclude.filter((x) => x !== id) : [...data.pickExclude, id];
+    save();
+    renderExcludeList();
+  }));
 }
 
 /* ---------- 画面：対戦の記録 ---------- */
@@ -1148,7 +1222,7 @@ function renderSettings() {
 async function exportData() {
   const payload = JSON.stringify({
     app: "mk8ta", version: 1, exportedAt: new Date().toISOString(),
-    records: data.records, targets: data.targets, targetLaps: data.targetLaps, battles: data.battles, images,
+    records: data.records, targets: data.targets, targetLaps: data.targetLaps, battles: data.battles, pickExclude: data.pickExclude, images,
   }, null, 1);
   const name = `マリカTA記録_${today()}.json`;
   const file = new File([payload], name, { type: "application/json" });
@@ -1215,6 +1289,10 @@ function importData(file) {
         bAdded++;
       }
     }
+    // おまかせの除外は、ファイルにあって今は除外していないコースを足す（今の除外は外さない）
+    if (Array.isArray(d.pickExclude)) {
+      for (const cid of d.pickExclude) if (COURSE_BY_ID[cid] && !isExcluded(cid)) data.pickExclude.push(cid);
+    }
     // 目標と画像は、まだ無いコースにだけ入れる（今あるものは上書きしない）
     let tAdded = 0, iAdded = 0;
     if (d.targets && typeof d.targets === "object") {
@@ -1256,6 +1334,7 @@ function route() {
     case "edit": return renderForm(null, parts[1]);
     case "settings": return renderSettings();
     case "pick": return renderPick();
+    case "exclude": return renderExclude();
     case "battle": return renderBattle();
     default: return renderHome();
   }

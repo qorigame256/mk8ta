@@ -177,6 +177,9 @@ main { padding: 12px 16px 96px; max-width: 640px; margin: 0 auto; }
 /* おまかせ */
 .pick-btn { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); }
 .pick-seg button { font-size: 12px; padding: 8px 0; }
+.ex-row .ex-mark { font-size: 12px; font-weight: 700; color: var(--muted); padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); flex: none; }
+.ex-row.ex .name { color: var(--muted); text-decoration: line-through; }
+.ex-row.ex .ex-mark { background: var(--accent); border-color: transparent; color: #fff; }
 .pick-card { background: var(--panel); border-radius: var(--radius); padding: 18px 16px; margin-top: 12px; text-align: center; }
 .pick-card img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 10px; margin-bottom: 12px; }
 .pick-card .cupname { color: var(--muted); font-size: 13px; }
