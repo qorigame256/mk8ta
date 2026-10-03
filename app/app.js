@@ -21,13 +21,14 @@ function loadData() {
       if (d && Array.isArray(d.records)) {
         d.settings = Object.assign({ cc: "150", scope: "all", sort: "cup", pick: "random" }, d.settings);
         if (!d.targets || typeof d.targets !== "object") d.targets = {};
+        if (!Array.isArray(d.battles)) d.battles = [];
         return d;
       }
     }
   } catch (e) {
     console.error(e);
   }
-  return { version: 1, records: [], targets: {}, settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
+  return { version: 1, records: [], targets: {}, battles: [], settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
 }
 
 let data = loadData();
@@ -46,6 +47,52 @@ function save() {
 // 目標タイムはコース×排気量ごと。キーは "c01|150"
 function targetOf(courseId, cc) {
   return data.targets[`${courseId}|${cc}`] ?? null;
+}
+
+/* ---------- 対戦の評価 ---------- */
+// 対戦で走ったコースに「良い／普通／悪い」を付けた記録。排気量は分けない。TA の記録とは別に持つ。
+// 1件 = { id, courseId, rating: 1（良い）| 0（普通）| -1（悪い）, date, createdAt }
+
+const RATINGS = [
+  [1, "良い", "良", "good"],
+  [0, "普通", "普", "normal"],
+  [-1, "悪い", "悪", "bad"],
+];
+const RATING_BY_VALUE = Object.fromEntries(RATINGS.map((r) => [r[0], r]));
+const BATTLE_RECENT = 5; // 苦手の判定に使う「最近の回数」
+
+function battlesOf(courseId) {
+  return data.battles.filter((b) => b.courseId === courseId).sort((a, b) => a.createdAt - b.createdAt);
+}
+
+// 直近5回の評価の合計（良い+1・普通0・悪い-1）。評価が無ければ null。マイナスなら「練習すべき」
+function battleScore(courseId) {
+  const all = battlesOf(courseId);
+  if (!all.length) return null;
+  const recent = all.slice(-BATTLE_RECENT);
+  return { score: recent.reduce((s, b) => s + b.rating, 0), recent, total: all.length, lastAt: all[all.length - 1].createdAt };
+}
+
+// 練習すべきコース：合計がマイナスのものを、低い順（同点は最後に評価したのが新しい順）
+function weakCourses() {
+  const out = [];
+  for (const c of COURSES) {
+    const bs = battleScore(c.id);
+    if (bs && bs.score < 0) out.push({ c, ...bs });
+  }
+  return out.sort((a, b) => a.score - b.score || b.lastAt - a.lastAt);
+}
+
+// 評価の小さな札。並びは古い→新しい
+function ratingChips(list) {
+  return list.map((b) => {
+    const r = RATING_BY_VALUE[b.rating];
+    return `<span class="rt rt-${r[3]}">${r[2]}</span>`;
+  }).join("");
+}
+
+function scoreText(score) {
+  return score > 0 ? `+${score}` : score < 0 ? `−${-score}` : "±0";
 }
 
 /* ---------- コース画像 ---------- */
@@ -276,6 +323,7 @@ function renderHome() {
 
   $view.innerHTML = `<div class="toolbar">${ccSwitch()}</div>
     <button class="btn pick-btn" id="pick-btn">🎲 おまかせで次のコースを決める</button>
+    <button class="btn pick-btn" id="battle-btn">⚔ 対戦の記録・練習すべきコース</button>
     <div class="toolbar"><div class="seg" id="scope-seg">
       <button data-v="all" class="${scope === "all" ? "on" : ""}">すべて</button>
       <button data-v="done" class="${scope === "done" ? "on" : ""}">記録あり</button>
@@ -293,6 +341,7 @@ function renderHome() {
     pickedId = null; // 一覧から入るたびに新しく選ぶ
     go("#/pick");
   });
+  document.getElementById("battle-btn").addEventListener("click", () => go("#/battle"));
   for (const [id, key] of [["scope-seg", "scope"], ["sort-seg", "sort"]]) {
     document.querySelectorAll(`#${id} button`).forEach((b) =>
       b.addEventListener("click", () => {
@@ -365,13 +414,15 @@ function renderHomeList() {
 
 /* ---------- 画面：おまかせ ---------- */
 // 選び方に応じて「出やすさ（重み）」を付け、重みに比例した確率で1コースを引く。
-// 対象は絞り込み・検索に関係なく全96コース（目標の2つは「目標あり・未達成」のコースだけ）。
+// 対象は絞り込み・検索に関係なく全96コース（目標の2つは「目標あり・未達成」のコースだけ、
+// 対戦で苦手は「練習すべきコース」だけ）。
 
 const PICK_MODES = [
   ["random", "ランダム", "全コースから同じ確率で選びます"],
   ["stale", "久しぶり", "未記録・しばらく記録していないコースほど出やすくなります"],
   ["near", "目標に近い", "目標まであと少しのコースほど出やすくなります（目標を達成したコースは出ません）"],
   ["far", "目標に遠い", "目標まで遠いコースほど出やすくなります（目標を達成したコースは出ません）"],
+  ["weak", "対戦で苦手", "対戦の「練習すべきコース」から、苦手なコースほど出やすくなります（排気量は関係ありません）"],
 ];
 
 let pickedId = null; // いま表示中のおまかせ結果（コース画面から戻ったときに引き直さないため）
@@ -384,6 +435,8 @@ function daysSince(iso) {
 
 // [{ c: コース, w: 重み }] を返す。重み0以下のコースは入れない
 function pickCandidates(mode, cc) {
+  // 対戦で苦手：直近5回の合計がマイナスのコース。重み＝マイナスの大きさ（−3 なら 3）
+  if (mode === "weak") return weakCourses().map((x) => ({ c: x.c, w: -x.score }));
   const out = [];
   for (const c of COURSES) {
     const recs = recordsOf(c.id, cc);
@@ -427,7 +480,9 @@ function renderPick() {
     <p class="summary">${PICK_MODES.find((m) => m[0] === mode)[2]}</p>`;
 
   if (!pickedId) {
-    html += `<p class="empty">目標タイムを決めていて、まだ達成していない ${cc}cc のコースがありません。<br>コースの画面で目標タイムを入れると選べるようになります。</p>`;
+    html += mode === "weak"
+      ? `<p class="empty">対戦で練習すべきコースがありません。<br>対戦の記録で「悪い」が続いたコースが選ばれるようになります。</p>`
+      : `<p class="empty">目標タイムを決めていて、まだ達成していない ${cc}cc のコースがありません。<br>コースの画面で目標タイムを入れると選べるようになります。</p>`;
   } else {
     const c = COURSE_BY_ID[pickedId];
     const recs = recordsOf(c.id, cc);
@@ -435,6 +490,7 @@ function renderPick() {
     const gap = targetGap(best, targetOf(c.id, cc));
     const last = recs.reduce((a, r) => (!a || r.date > a ? r.date : a), null);
     const ago = last ? daysSince(last) : null;
+    const bs = battleScore(c.id);
     html += `<div class="pick-card">
       ${images[c.id] ? `<img src="${images[c.id]}" alt="">` : ""}
       <div class="cupname">${esc(c.cup)}</div>
@@ -442,6 +498,7 @@ function renderPick() {
       <div class="pb ${best ? "" : "none"}">${best ? `自己ベスト ${fmt(best.timeMs)}` : "まだ記録がありません"}</div>
       ${gap != null ? `<div class="gap-big ${gap > 0 ? "" : "ok"}">${gapText(gap)}</div>` : ""}
       ${last ? `<div class="sub">最後の記録 ${fmtDate(last)}（${ago <= 0 ? "今日" : `${ago}日前`}）・${recs.length}件</div>` : ""}
+      ${bs ? `<div class="sub">対戦の評価（直近${bs.recent.length}回）${ratingChips(bs.recent)} 合計 ${scoreText(bs.score)}</div>` : ""}
     </div>
     <button class="btn primary" id="pick-go">このコースへ</button>
     <button class="btn" id="pick-again">🎲 もう一回</button>`;
@@ -464,6 +521,156 @@ function renderPick() {
       renderPick();
     });
   }
+}
+
+/* ---------- 画面：対戦の記録 ---------- */
+// 「入力」：コースをタップ → 下から出る評価ボタンを押した時点で保存。続けて次のコースへ。
+// 「練習すべきコース」：直近5回の合計がマイナスのコースを苦手な順に。
+
+let battleTab = "input"; // input / weak（アプリを閉じるまで覚えておく）
+let battleSearch = "";
+
+function renderBattle() {
+  $title.textContent = "対戦の記録";
+  $back.hidden = false;
+  const weakN = weakCourses().length;
+
+  let html = `<div class="toolbar"><div class="seg" id="battle-seg">
+      <button data-v="input" class="${battleTab === "input" ? "on" : ""}">入力</button>
+      <button data-v="weak" class="${battleTab === "weak" ? "on" : ""}">練習すべきコース${weakN ? `（${weakN}）` : ""}</button>
+    </div></div>`;
+
+  if (battleTab === "input") {
+    html += `<p class="summary">対戦で走ったコースをタップして、走りを3段階で評価します。押した時点で保存されます。</p>
+      <div class="search"><input id="b-search" class="input" type="search" placeholder="コース名で検索" autocomplete="off" value="${esc(battleSearch)}"></div>
+      <div id="battle-list"></div>
+      <div id="battle-recent"></div>
+      <div class="sheet-bg" id="sheet-bg" hidden></div>
+      <div class="sheet" id="sheet" hidden></div>`;
+  } else {
+    html += `<p class="summary">直近${BATTLE_RECENT}回の評価（良い＋1・普通0・悪い−1）の合計がマイナスのコースです。苦手な順に並べています。良い評価が付けば自然に外れます。</p>`;
+    const weak = weakCourses();
+    if (weak.length) {
+      html += `<button class="btn pick-btn" id="weak-pick">🎲 この中からおまかせで選ぶ</button>
+        <div class="list" style="margin-top:12px">${weak.map((x) => `<button class="row" data-id="${x.c.id}">
+          <span class="name">${courseLabel(x.c.name)}<small>${esc(x.c.cup)}・評価 ${x.total}回</small></span>
+          <span class="right"><span class="score bad">${scoreText(x.score)}</span><span class="chips">${ratingChips(x.recent)}</span></span>
+          <span class="chev">›</span></button>`).join("")}</div>`;
+    } else {
+      html += `<p class="empty">いま練習すべきコースはありません。<br>「入力」で対戦の評価を付けると、悪い評価が続いたコースがここに出ます。</p>`;
+    }
+  }
+  $view.innerHTML = html;
+
+  document.querySelectorAll("#battle-seg button").forEach((b) =>
+    b.addEventListener("click", () => {
+      battleTab = b.dataset.v;
+      renderBattle();
+    })
+  );
+
+  if (battleTab === "weak") {
+    $view.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => go(`#/course/${r.dataset.id}`)));
+    const $wp = document.getElementById("weak-pick");
+    if ($wp) $wp.addEventListener("click", () => {
+      data.settings.pick = "weak";
+      save();
+      pickedId = null;
+      go("#/pick");
+    });
+    return;
+  }
+
+  // 検索は一覧の部分だけ描き直す（キーボードが閉じないように）
+  document.getElementById("b-search").addEventListener("input", (e) => {
+    battleSearch = e.target.value;
+    renderBattleList();
+  });
+  document.getElementById("sheet-bg").addEventListener("click", closeSheet);
+  renderBattleList();
+  renderBattleRecent();
+}
+
+function renderBattleList() {
+  const q = norm(battleSearch);
+  const t = today();
+  const shown = COURSES.filter((c) => !q || norm(c.name).includes(q) || norm(c.cup).includes(q));
+  let html = "";
+  for (const cup of CUPS) {
+    const rows = shown.filter((c) => c.cup === cup.name);
+    if (!rows.length) continue;
+    html += `<section class="cup"><h2>${esc(cup.name)}${cup.dlc ? '<span class="dlc">追加</span>' : ""}</h2><div class="list">${rows.map((c) => {
+      const todays = data.battles.filter((b) => b.courseId === c.id && b.date === t).sort((a, b) => a.createdAt - b.createdAt);
+      return `<button class="row" data-id="${c.id}">
+        <span class="name">${courseLabel(c.name)}${todays.length ? `<small>今日 ${ratingChips(todays)}</small>` : ""}</span>
+        <span class="chev">＋</span></button>`;
+    }).join("")}</div></section>`;
+  }
+  if (!shown.length) html = `<p class="empty">見つかりません</p>`;
+  const $list = document.getElementById("battle-list");
+  $list.innerHTML = html;
+  $list.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => openSheet(r.dataset.id)));
+}
+
+// 最近の入力（新しい順に20件）。間違えたものはここで消せる
+function renderBattleRecent() {
+  const recent = data.battles.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, 20);
+  const $box = document.getElementById("battle-recent");
+  if (!recent.length) { $box.innerHTML = ""; return; }
+  const t = today();
+  $box.innerHTML = `<div class="section-title">最近の入力（新しい順）</div><div class="list">${recent.map((b) => {
+    const c = COURSE_BY_ID[b.courseId];
+    return `<div class="row brec">
+      <span class="name">${courseLabel(c.name)}<small>${b.date === t ? "今日" : fmtDate(b.date)}</small></span>
+      ${ratingChips([b])}
+      <button class="btn small del" data-id="${b.id}" aria-label="この評価を消す">消す</button></div>`;
+  }).join("")}</div>`;
+  $box.querySelectorAll(".del").forEach((btn) => btn.addEventListener("click", () => {
+    const b = data.battles.find((x) => x.id === btn.dataset.id);
+    if (!b || !confirm(`${COURSE_BY_ID[b.courseId].name} の「${RATING_BY_VALUE[b.rating][1]}」を消します。`)) return;
+    data.battles = data.battles.filter((x) => x !== b);
+    save();
+    renderBattleList();
+    renderBattleRecent();
+  }));
+}
+
+function openSheet(courseId) {
+  const c = COURSE_BY_ID[courseId];
+  const $sheet = document.getElementById("sheet");
+  $sheet.innerHTML = `<div class="cupname">${esc(c.cup)}</div>
+    <div class="cname">${courseLabel(c.name)}</div>
+    <div class="rate-btns">${RATINGS.map(([v, label, , cls]) => `<button class="rate rt-${cls}" data-v="${v}">${label}</button>`).join("")}</div>
+    <button class="btn" id="sheet-cancel">やめる</button>`;
+  $sheet.hidden = false;
+  document.getElementById("sheet-bg").hidden = false;
+  document.getElementById("sheet-cancel").addEventListener("click", closeSheet);
+  $sheet.querySelectorAll(".rate").forEach((btn) => btn.addEventListener("click", () => {
+    const rating = Number(btn.dataset.v);
+    data.battles.push({ id: newId(), courseId, rating, date: today(), createdAt: Date.now() });
+    if (!save()) return;
+    const bs = battleScore(courseId);
+    toast(`${c.name}：${RATING_BY_VALUE[rating][1]}` + (bs.score < 0 ? "（練習すべきコース）" : ""));
+    closeSheet();
+    // 検索して選んだときは、次のコースを探しやすいよう検索欄を空にする
+    if (battleSearch) {
+      battleSearch = "";
+      const $s = document.getElementById("b-search");
+      $s.value = "";
+      $s.blur();
+      window.scrollTo(0, 0);
+    }
+    renderBattleList();
+    renderBattleRecent();
+    // タブの件数を更新
+    const n = weakCourses().length;
+    document.querySelector('#battle-seg button[data-v="weak"]').textContent = `練習すべきコース${n ? `（${n}）` : ""}`;
+  }));
+}
+
+function closeSheet() {
+  document.getElementById("sheet").hidden = true;
+  document.getElementById("sheet-bg").hidden = true;
 }
 
 /* ---------- 画面：コース詳細 ---------- */
@@ -507,6 +714,14 @@ function renderCourse(courseId) {
       ${target != null ? '<button class="btn small" id="t-clear">消す</button>' : ""}
     </div>
     <p class="hint" id="t-hint">${target != null ? `いまの目標：${fmt(target)}` : "数字だけ入力（150000 → 1:50.000）"}</p></div>`;
+
+  const bs = battleScore(courseId);
+  if (bs) {
+    const cnt = (v) => battlesOf(courseId).filter((b) => b.rating === v).length;
+    html += `<div class="card"><h2>対戦の評価（排気量共通）</h2>
+      <p>直近${bs.recent.length}回 ${ratingChips(bs.recent)}　合計 <b class="score ${bs.score < 0 ? "bad" : ""}">${scoreText(bs.score)}</b>${bs.score < 0 ? "（練習すべきコース）" : ""}</p>
+      <p>これまで ${bs.total}回：良い ${cnt(1)}・普通 ${cnt(0)}・悪い ${cnt(-1)}</p></div>`;
+  }
 
   if (recs.length >= 2) html += chartSvg(recs, target);
 
@@ -804,11 +1019,11 @@ function renderSettings() {
       <button class="btn primary" id="export">記録を書き出す</button>
       <button class="btn" id="import">書き出したファイルを読み込む</button>
       <input type="file" id="import-file" accept=".json,application/json" hidden>
-      <p class="hint">目標タイムとコース画像も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像は、まだ無いコースにだけ入ります）。</p>
+      <p class="hint">目標タイム・コース画像・対戦の評価も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像は、まだ無いコースにだけ入ります）。</p>
     </div>
     <div class="card"><h2>保存の状態</h2><p id="persist">確認中…</p></div>
     <div class="card"><h2>全コースの記録をリセット</h2>
-      <p>150cc・200cc の記録 ${n} 件をすべて消します。目標タイムとコース画像は残ります。先に書き出しておくと、読み込みで元に戻せます。</p>
+      <p>150cc・200cc の記録 ${n} 件をすべて消します。目標タイム・コース画像・対戦の評価は残ります。先に書き出しておくと、読み込みで元に戻せます。</p>
       <button class="btn danger" id="reset-all" ${n ? "" : "disabled"}>全コースの記録をリセット</button>
     </div>
     <div class="card"><h2>このアプリについて</h2>
@@ -846,7 +1061,7 @@ function renderSettings() {
 async function exportData() {
   const payload = JSON.stringify({
     app: "mk8ta", version: 1, exportedAt: new Date().toISOString(),
-    records: data.records, targets: data.targets, images,
+    records: data.records, targets: data.targets, battles: data.battles, images,
   }, null, 1);
   const name = `マリカTA記録_${today()}.json`;
   const file = new File([payload], name, { type: "application/json" });
@@ -899,6 +1114,20 @@ function importData(file) {
       have.add(r.id);
       added++;
     }
+    // 対戦の評価も同じ id のものは追加しない
+    let bAdded = 0;
+    if (Array.isArray(d.battles)) {
+      const haveB = new Set(data.battles.map((b) => b.id));
+      for (const b of d.battles) {
+        const ok = b && typeof b.id === "string" && COURSE_BY_ID[b.courseId] && RATING_BY_VALUE[b.rating]
+          && /^\d{4}-\d{2}-\d{2}$/.test(b.date);
+        if (!ok) { skipped++; continue; }
+        if (haveB.has(b.id)) continue;
+        data.battles.push({ id: b.id, courseId: b.courseId, rating: b.rating, date: b.date, createdAt: Number(b.createdAt) || Date.now() });
+        haveB.add(b.id);
+        bAdded++;
+      }
+    }
     // 目標と画像は、まだ無いコースにだけ入れる（今あるものは上書きしない）
     let tAdded = 0, iAdded = 0;
     if (d.targets && typeof d.targets === "object") {
@@ -915,7 +1144,7 @@ function importData(file) {
         try { await setImage(cid, url); iAdded++; } catch (e) { console.error(e); }
       }
     }
-    toast(`${added}件を読み込みました` + (tAdded || iAdded ? `（目標${tAdded}・画像${iAdded}）` : "") + (skipped ? `（読めない記録 ${skipped}件は飛ばしました）` : ""));
+    toast(`${added}件を読み込みました` + (bAdded ? `（対戦の評価${bAdded}件）` : "") + (tAdded || iAdded ? `（目標${tAdded}・画像${iAdded}）` : "") + (skipped ? `（読めない記録 ${skipped}件は飛ばしました）` : ""));
     renderSettings();
   };
   reader.readAsText(file);
@@ -932,6 +1161,7 @@ function route() {
     case "edit": return renderForm(null, parts[1]);
     case "settings": return renderSettings();
     case "pick": return renderPick();
+    case "battle": return renderBattle();
     default: return renderHome();
   }
 }
