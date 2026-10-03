@@ -817,13 +817,7 @@ function renderCourse(courseId) {
       <button type="button" class="btn small" id="t-add-lap" style="margin-top:8px">＋ ラップ欄を増やす</button>
     </details></div>`;
 
-  const bs = battleScore(courseId);
-  if (bs) {
-    const cnt = (v) => battlesOf(courseId).filter((b) => b.rating === v).length;
-    html += `<div class="card"><h2>対戦の評価（排気量共通）</h2>
-      <p>直近${bs.recent.length}回 ${ratingChips(bs.recent)}　合計 <b class="score ${bs.score < 0 ? "bad" : ""}">${scoreText(bs.score)}</b>${bs.score < 0 ? "（練習すべきコース）" : ""}</p>
-      <p>これまで ${bs.total}回：良い ${cnt(1)}・普通 ${cnt(0)}・悪い ${cnt(-1)}</p></div>`;
-  }
+  html += `<div class="card" id="course-battle"></div>`;
 
   if (recs.length >= 2) html += chartSvg(recs, target);
 
@@ -847,6 +841,7 @@ function renderCourse(courseId) {
   $view.innerHTML = html;
 
   bindCcSwitch(() => renderCourse(courseId));
+  renderCourseBattle(courseId);
   document.getElementById("add").addEventListener("click", () => go(`#/add/${courseId}`));
   $view.querySelectorAll(".rec").forEach((r) => r.addEventListener("click", () => go(`#/edit/${r.dataset.id}`)));
 
@@ -951,6 +946,47 @@ function renderCourse(courseId) {
     toast(`${cc}cc の記録をリセットしました`);
     renderCourse(courseId);
   });
+}
+
+// コース画面の「対戦の評価」の枠。ここからも評価を付けられ、今日付けた分は消せる。
+// 押すたびに画面全体ではなくこの枠だけ描き直す（目標タイムの入力中の値やスクロール位置を崩さないため）
+function renderCourseBattle(courseId) {
+  const $box = document.getElementById("course-battle");
+  const bs = battleScore(courseId);
+  const t = today();
+  let html = `<h2>対戦の評価（排気量共通）</h2>`;
+  if (bs) {
+    const cnt = (v) => battlesOf(courseId).filter((b) => b.rating === v).length;
+    html += `<p>直近${bs.recent.length}回 ${ratingChips(bs.recent)}　合計 <b class="score ${bs.score < 0 ? "bad" : ""}">${scoreText(bs.score)}</b>${bs.score < 0 ? "（練習すべきコース）" : ""}</p>
+      <p>これまで ${bs.total}回：良い ${cnt(1)}・普通 ${cnt(0)}・悪い ${cnt(-1)}</p>`;
+  } else {
+    html += `<p>対戦でこのコースを走ったら、走りを3段階で評価できます。</p>`;
+  }
+  html += `<div class="rate-btns course-rate">${RATINGS.map(([v, label, , cls]) => `<button class="rate rt-${cls}" data-v="${v}">${label}</button>`).join("")}</div>`;
+  const todays = battlesOf(courseId).filter((b) => b.date === t).reverse();
+  if (todays.length) {
+    html += `<div class="list today-rates">${todays.map((b) => `<div class="row brec">
+      <span class="name"><small>今日 ${new Date(b.createdAt).toTimeString().slice(0, 5)}</small></span>
+      ${ratingChips([b])}
+      <button class="btn small del" data-id="${b.id}" aria-label="この評価を消す">消す</button></div>`).join("")}</div>`;
+  }
+  $box.innerHTML = html;
+  const name = COURSE_BY_ID[courseId].name;
+  $box.querySelectorAll(".rate").forEach((btn) => btn.addEventListener("click", () => {
+    const rating = Number(btn.dataset.v);
+    data.battles.push({ id: newId(), courseId, rating, date: today(), createdAt: Date.now() });
+    if (!save()) return;
+    const s = battleScore(courseId);
+    toast(`${name}：${RATING_BY_VALUE[rating][1]}` + (s.score < 0 ? "（練習すべきコース）" : ""));
+    renderCourseBattle(courseId);
+  }));
+  $box.querySelectorAll(".del").forEach((btn) => btn.addEventListener("click", () => {
+    const b = data.battles.find((x) => x.id === btn.dataset.id);
+    if (!b || !confirm(`${name} の「${RATING_BY_VALUE[b.rating][1]}」を消します。`)) return;
+    data.battles = data.battles.filter((x) => x !== b);
+    save();
+    renderCourseBattle(courseId);
+  }));
 }
 
 function comboText(r) {
