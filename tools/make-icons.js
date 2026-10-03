@@ -1,4 +1,4 @@
-// ホーム画面用アイコン（赤地に白いストップウォッチ）を app/icons/ に PNG で書き出す。
+// ホーム画面用アイコン（紫地に白い「TA」の文字）を app/icons/ に PNG で書き出す。
 // 使い方: node tools/make-icons.js
 const fs = require("fs");
 const path = require("path");
@@ -7,22 +7,21 @@ const zlib = require("zlib");
 const OUT = path.join(__dirname, "..", "app", "icons");
 fs.mkdirSync(OUT, { recursive: true });
 
-// 0〜1 の座標で「白く塗るか」を返す
+// 0〜1 の座標で「白く塗るか」を返す（太い T と A）
 function white(x, y) {
-  const cx = 0.5, cy = 0.56, r = 0.29;
-  const d = Math.hypot(x - cx, y - cy);
-  if (d <= r && d >= r - 0.055) return true; // 外周の輪
-  // 上のつまみ
-  if (Math.abs(x - cx) <= 0.06 && y >= 0.17 && y <= 0.23) return true;
-  if (Math.abs(x - cx) <= 0.025 && y >= 0.22 && y <= 0.28) return true;
-  // 針（中心から右上へ）
-  const ang = (-50 * Math.PI) / 180;
-  const ux = Math.cos(ang), uy = Math.sin(ang);
-  const px = x - cx, py = y - cy;
-  const along = px * ux + py * uy;
-  const across = Math.abs(-px * uy + py * ux);
-  if (along >= -0.02 && along <= r - 0.09 && across <= 0.022) return true;
-  if (d <= 0.04) return true; // 中心の点
+  const top = 0.31, bottom = 0.69;
+  if (y < top || y > bottom) return false;
+  // T：横棒と縦棒
+  if (x >= 0.13 && x <= 0.47 && y <= top + 0.085) return true;
+  if (Math.abs(x - 0.30) <= 0.045) return true;
+  // A：頂点 (0.70, top) から左右の足へ伸びる2本の太線＋横棒
+  const ax = 0.70, h = bottom - top, half = 0.165;
+  for (const dir of [-1, 1]) {
+    const dx = dir * half, len = Math.hypot(dx, h);
+    const dist = Math.abs((x - ax) * h - (y - top) * dx) / len;
+    if (dist <= 0.045) return true;
+  }
+  if (y >= 0.555 && y <= 0.625 && Math.abs(x - ax) <= half * ((y - top) / h)) return true;
   return false;
 }
 
@@ -37,9 +36,9 @@ function png(size) {
         for (let b = 0; b < SS; b++) if (white((i + (a + 0.5) / SS) / size, (j + (b + 0.5) / SS) / size)) w++;
       const t = w / (SS * SS);
       const o = j * (size * 3 + 1) + 1 + i * 3;
-      raw[o] = Math.round(0xe8 + (255 - 0xe8) * t);
-      raw[o + 1] = Math.round(0x47 + (255 - 0x47) * t);
-      raw[o + 2] = Math.round(0x3c + (255 - 0x3c) * t);
+      raw[o] = Math.round(0x7b + (255 - 0x7b) * t);
+      raw[o + 1] = Math.round(0x3f + (255 - 0x3f) * t);
+      raw[o + 2] = Math.round(0xe4 + (255 - 0xe4) * t);
     }
   }
   const crcTable = Array.from({ length: 256 }, (_, n) => {

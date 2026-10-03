@@ -10,5 +10,5 @@ MK8DX のタイムアタック記録を iPhone で管理する個人用 PWA。�
 - 公開先は `https://qorigame256.github.io/mk8ta/`（リポジトリ `qorigame256/mk8ta` は**公開**）。main へ push すると `.github/workflows/pages.yml` が `app/` だけを公開する。**秘密・個人情報をリポジトリに入れない。**
 - このリポジトリの git の作者は `qorigame256` / `328730295+qorigame256@users.noreply.github.com`（ローカル設定）。普段の Apple の転送用アドレスを公開リポジトリに出さないため。変えないこと。
 - ファイルを変えて push しても、iPhone では「次に開いたとき」に新しい版になる（sw.js の方式）。
-- 動作確認は `.claude/launch.json` の `app`（`node tools/serve.js`、http://localhost:8765/）をブラウザ画面で開き、iPhone 幅（375px）で見る。
+- 動作確認は `.claude/launch.json` の `app`（`node tools/serve.js`、http://localhost:8765/。別の会話が使用中なら自動で別の番号になる）をブラウザ画面で開き、iPhone 幅（375px）で見る。
 - サービスワーカー（`app/sw.js`）は「保存済みの版を先に出し裏で更新」方式。ファイルを足したら `FILES` にも足す。

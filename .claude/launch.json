@@ -5,7 +5,8 @@
       "name": "app",
       "runtimeExecutable": "node",
       "runtimeArgs": ["tools/serve.js"],
-      "port": 8765
+      "port": 8765,
+      "autoPort": true
     }
   ]
 }

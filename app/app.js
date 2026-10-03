@@ -19,14 +19,15 @@ function loadData() {
     if (raw) {
       const d = JSON.parse(raw);
       if (d && Array.isArray(d.records)) {
-        d.settings = Object.assign({ cc: "150", scope: "all" }, d.settings);
+        d.settings = Object.assign({ cc: "150", scope: "all", sort: "cup" }, d.settings);
+        if (!d.targets || typeof d.targets !== "object") d.targets = {};
         return d;
       }
     }
   } catch (e) {
     console.error(e);
   }
-  return { version: 1, records: [], settings: { cc: "150", scope: "all" } };
+  return { version: 1, records: [], targets: {}, settings: { cc: "150", scope: "all", sort: "cup" } };
 }
 
 let data = loadData();
@@ -40,6 +41,75 @@ function save() {
     toast("保存に失敗しました。容量不足の可能性があります");
     return false;
   }
+}
+
+// 目標タイムはコース×排気量ごと。キーは "c01|150"
+function targetOf(courseId, cc) {
+  return data.targets[`${courseId}|${cc}`] ?? null;
+}
+
+/* ---------- コース画像 ---------- */
+// 画像は大きいので localStorage ではなく IndexedDB（＝ブラウザ内の大きめの保存場所）に入れる。
+// 中身は縮小した JPEG の data URL 文字列。キーはコースの id。端末の外へは出さない（書き出しファイルには含める）。
+
+const IMG_DB = "mk8ta-images";
+const images = {}; // courseId → data URL（起動時に全部読み込んでおく）
+
+function imgDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IMG_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("img");
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function imgTx(mode, fn) {
+  const db = await imgDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("img", mode);
+    const result = fn(tx.objectStore("img"));
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadImages() {
+  const all = {};
+  await imgTx("readonly", (st) => {
+    st.openCursor().onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur) return;
+      all[cur.key] = cur.value;
+      cur.continue();
+    };
+  });
+  Object.assign(images, all);
+}
+
+async function setImage(courseId, dataUrl) {
+  await imgTx("readwrite", (st) => (dataUrl ? st.put(dataUrl, courseId) : st.delete(courseId)));
+  if (dataUrl) images[courseId] = dataUrl;
+  else delete images[courseId];
+}
+
+// 選んだ写真を横 640px 以内の JPEG に縮める（そのままだと1枚数 MB になるため）
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 640 / img.naturalWidth);
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.naturalWidth * scale);
+      c.height = Math.round(img.naturalHeight * scale);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL("image/jpeg", 0.8));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("画像を読めません")); };
+    img.src = url;
+  });
 }
 
 /* ---------- タイムの変換 ---------- */
@@ -145,6 +215,37 @@ function byDate(a, b) {
   return a.date < b.date ? -1 : a.date > b.date ? 1 : a.createdAt - b.createdAt;
 }
 
+// 自己ベストと目標の差。プラス＝まだ遅い（あと何秒）、0以下＝達成
+function targetGap(best, target) {
+  if (!best || target == null) return null;
+  return best.timeMs - target;
+}
+
+function gapText(gap) {
+  if (gap == null) return "";
+  return gap > 0 ? `目標まで ${fmtDiff(gap)}` : `目標達成 ${fmtDiff(gap)}`;
+}
+
+// 日付順に見て、その時点の自己ベストを縮めた記録 → 縮めた差（マイナスの ms）
+function improvements(recsByDate) {
+  const out = {};
+  let run = null;
+  for (const r of recsByDate) {
+    if (run != null && r.timeMs < run) out[r.id] = r.timeMs - run;
+    if (run == null || r.timeMs < run) run = r.timeMs;
+  }
+  return out;
+}
+
+// 検索用に表記ゆれを吸収する：カタカナ→ひらがな、英字は小文字、空白は無視
+function norm(str) {
+  return String(str)
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/\s+/g, "");
+}
+
 function ccSwitch() {
   const cc = data.settings.cc;
   return `<div class="seg" id="cc-seg">
@@ -165,58 +266,96 @@ function bindCcSwitch(rerender) {
 
 /* ---------- 画面：コース一覧 ---------- */
 
+let searchText = ""; // 検索欄の文字（アプリを閉じるまで覚えておく）
+
 function renderHome() {
   $title.textContent = "マリカTA記録";
   $back.hidden = true;
-  const cc = data.settings.cc;
   const scope = data.settings.scope; // all / done / todo
+  const sort = data.settings.sort; // cup / target
 
-  let doneCount = 0;
-  const bests = {};
-  for (const c of COURSES) {
-    const b = bestOf(recordsOf(c.id, cc));
-    bests[c.id] = b;
-    if (b) doneCount++;
-  }
-
-  let html = `<div class="toolbar">${ccSwitch()}</div>
+  $view.innerHTML = `<div class="toolbar">${ccSwitch()}</div>
     <div class="toolbar"><div class="seg" id="scope-seg">
       <button data-v="all" class="${scope === "all" ? "on" : ""}">すべて</button>
       <button data-v="done" class="${scope === "done" ? "on" : ""}">記録あり</button>
       <button data-v="todo" class="${scope === "todo" ? "on" : ""}">未記録</button>
     </div></div>
-    <p class="summary">${cc}cc：${COURSES.length}コース中 ${doneCount}コースに記録あり</p>`;
-
-  for (const cup of CUPS) {
-    const rows = COURSES.filter((c) => c.cup === cup.name).filter((c) =>
-      scope === "done" ? bests[c.id] : scope === "todo" ? !bests[c.id] : true
-    );
-    if (!rows.length) continue;
-    html += `<section class="cup"><h2>${esc(cup.name)}${cup.dlc ? '<span class="dlc">追加</span>' : ""}</h2><div class="list">`;
-    for (const c of rows) {
-      const b = bests[c.id];
-      const n = recordsOf(c.id, cc).length;
-      html += `<button class="row" data-id="${c.id}">
-        <span class="name">${courseLabel(c.name)}${n ? `<small>${n}件</small>` : ""}</span>
-        <span class="pb ${b ? "" : "none"}">${b ? fmt(b.timeMs) : "—"}</span>
-        <span class="chev">›</span></button>`;
-    }
-    html += `</div></section>`;
-  }
-  if (scope !== "all" && (scope === "done" ? doneCount === 0 : doneCount === COURSES.length)) {
-    html += `<p class="empty">${scope === "done" ? "まだ記録がありません" : "全コースに記録があります"}</p>`;
-  }
-  $view.innerHTML = html;
+    <div class="toolbar"><div class="seg" id="sort-seg">
+      <button data-v="cup" class="${sort === "cup" ? "on" : ""}">カップ順</button>
+      <button data-v="target" class="${sort === "target" ? "on" : ""}">目標に近い順</button>
+    </div></div>
+    <div class="search"><input id="search" class="input" type="search" placeholder="コース名で検索" autocomplete="off" value="${esc(searchText)}"></div>
+    <div id="home-list"></div>`;
 
   bindCcSwitch(renderHome);
-  document.querySelectorAll("#scope-seg button").forEach((b) =>
-    b.addEventListener("click", () => {
-      data.settings.scope = b.dataset.v;
-      save();
-      renderHome();
-    })
+  for (const [id, key] of [["scope-seg", "scope"], ["sort-seg", "sort"]]) {
+    document.querySelectorAll(`#${id} button`).forEach((b) =>
+      b.addEventListener("click", () => {
+        data.settings[key] = b.dataset.v;
+        save();
+        renderHome();
+      })
+    );
+  }
+  // 検索は一覧の部分だけ描き直す（全体を描き直すと入力中のキーボードが閉じるため）
+  document.getElementById("search").addEventListener("input", (e) => {
+    searchText = e.target.value;
+    renderHomeList();
+  });
+  renderHomeList();
+}
+
+function renderHomeList() {
+  const cc = data.settings.cc;
+  const scope = data.settings.scope;
+  const q = norm(searchText);
+
+  let doneCount = 0;
+  const info = {};
+  for (const c of COURSES) {
+    const recs = recordsOf(c.id, cc);
+    const best = bestOf(recs);
+    if (best) doneCount++;
+    info[c.id] = { best, n: recs.length, gap: targetGap(best, targetOf(c.id, cc)) };
+  }
+
+  const shown = COURSES.filter((c) =>
+    (scope === "done" ? info[c.id].best : scope === "todo" ? !info[c.id].best : true) &&
+    (!q || norm(c.name).includes(q) || norm(c.cup).includes(q))
   );
-  $view.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => go(`#/course/${r.dataset.id}`)));
+
+  const row = (c, withCup) => {
+    const { best, n, gap } = info[c.id];
+    const sub = [withCup ? esc(c.cup) : "", n ? `${n}件` : ""].filter(Boolean).join("・");
+    return `<button class="row" data-id="${c.id}">
+      ${images[c.id] ? `<img class="thumb" src="${images[c.id]}" alt="">` : ""}
+      <span class="name">${courseLabel(c.name)}${sub ? `<small>${sub}</small>` : ""}</span>
+      <span class="right"><span class="pb ${best ? "" : "none"}">${best ? fmt(best.timeMs) : "—"}</span>
+        ${gap != null ? `<span class="gap ${gap > 0 ? "" : "ok"}">${gapText(gap)}</span>` : ""}</span>
+      <span class="chev">›</span></button>`;
+  };
+  const group = (title, list, withCup) =>
+    list.length ? `<section class="cup"><h2>${title}</h2><div class="list">${list.map((c) => row(c, withCup)).join("")}</div></section>` : "";
+
+  let html = `<p class="summary">${cc}cc：${COURSES.length}コース中 ${doneCount}コースに記録あり</p>`;
+  if (data.settings.sort === "target") {
+    // 未達成（あと少しの順）→ 達成済み（目標に近い順）→ 目標か記録がないもの（カップ順）
+    const notYet = shown.filter((c) => info[c.id].gap > 0).sort((a, b) => info[a.id].gap - info[b.id].gap);
+    const done = shown.filter((c) => info[c.id].gap != null && info[c.id].gap <= 0).sort((a, b) => info[b.id].gap - info[a.id].gap);
+    const none = shown.filter((c) => info[c.id].gap == null);
+    html += group("目標まで あと少しの順", notYet, true) + group("目標達成", done, true) + group("目標または記録なし", none, true);
+  } else {
+    for (const cup of CUPS) {
+      const rows = shown.filter((c) => c.cup === cup.name);
+      html += group(`${esc(cup.name)}${cup.dlc ? '<span class="dlc">追加</span>' : ""}`, rows, false);
+    }
+  }
+  if (!shown.length) {
+    html += `<p class="empty">${q ? "見つかりません" : scope === "done" ? "まだ記録がありません" : "全コースに記録があります"}</p>`;
+  }
+  const $list = document.getElementById("home-list");
+  $list.innerHTML = html;
+  $list.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => go(`#/course/${r.dataset.id}`)));
 }
 
 /* ---------- 画面：コース詳細 ---------- */
@@ -229,20 +368,39 @@ function renderCourse(courseId) {
   const cc = data.settings.cc;
   const recs = recordsOf(courseId, cc).sort(byDate);
   const best = bestOf(recs);
+  const target = targetOf(courseId, cc);
+  const gap = targetGap(best, target);
+  const imp = improvements(recs);
 
-  let html = `<div class="toolbar">${ccSwitch()}</div>`;
+  let html = images[courseId]
+    ? `<div class="course-img"><img src="${images[courseId]}" alt="${esc(course.name)}">
+        <div class="img-btns"><button class="btn small" id="img-pick">画像を変更</button><button class="btn small" id="img-del">画像を外す</button></div></div>`
+    : `<button class="img-empty" id="img-pick">＋ コースの画像を選ぶ</button>`;
+  html += `<input type="file" id="img-file" accept="image/*" hidden>`;
+  html += `<div class="toolbar">${ccSwitch()}</div>`;
   html += `<div class="pb-card"><div class="label">${cc}cc 自己ベスト</div>`;
   if (best) {
-    html += `<div class="big">${fmt(best.timeMs)}</div><div class="sub">${fmtDate(best.date)}`;
+    html += `<div class="big">${fmt(best.timeMs)}</div>`;
+    if (imp[best.id] != null) html += `<div class="up">前のベストから ${fmtDiff(imp[best.id])}</div>`;
+    html += `<div class="sub">${fmtDate(best.date)}`;
     const combo = comboText(best);
     if (combo) html += `<br>${esc(combo)}`;
     html += `</div>`;
   } else {
     html += `<div class="big none">まだ記録がありません</div>`;
   }
+  if (gap != null) html += `<div class="gap-big ${gap > 0 ? "" : "ok"}">${gapText(gap)}</div>`;
   html += `</div>`;
 
-  if (recs.length >= 2) html += chartSvg(recs);
+  html += `<div class="card target"><h2>${cc}cc 目標タイム</h2>
+    <div class="target-edit">
+      <input id="t-in" class="input" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="150000" value="${toDigits(target)}">
+      <button class="btn small" id="t-save" disabled>決定</button>
+      ${target != null ? '<button class="btn small" id="t-clear">消す</button>' : ""}
+    </div>
+    <p class="hint" id="t-hint">${target != null ? `いまの目標：${fmt(target)}` : "数字だけ入力（150000 → 1:50.000）"}</p></div>`;
+
+  if (recs.length >= 2) html += chartSvg(recs, target);
 
   html += `<div class="section-title">記録（新しい順）</div>`;
   if (recs.length) {
@@ -251,11 +409,12 @@ function renderCourse(courseId) {
       const isBest = best && r.id === best.id;
       const meta = [fmtDate(r.date), comboText(r), r.memo].filter(Boolean).join("　");
       html += `<button class="row rec" data-id="${r.id}">
-        <span class="name"><span class="time">${fmt(r.timeMs)}</span>${isBest ? '<span class="badge">PB</span>' : ""}
+        <span class="name"><span class="time">${fmt(r.timeMs)}</span>${isBest ? '<span class="badge">PB</span>' : ""}${imp[r.id] != null ? `<span class="upd">更新 ${fmtDiff(imp[r.id])}</span>` : ""}
         <span class="meta">${esc(meta)}</span></span>
         <span class="chev">›</span></button>`;
     }
     html += `</div>`;
+    html += `<button class="btn danger" id="reset-course">このコースの ${cc}cc の記録をリセット</button>`;
   } else {
     html += `<p class="empty">右下の ＋ から記録を追加できます</p>`;
   }
@@ -265,6 +424,66 @@ function renderCourse(courseId) {
   bindCcSwitch(() => renderCourse(courseId));
   document.getElementById("add").addEventListener("click", () => go(`#/add/${courseId}`));
   $view.querySelectorAll(".rec").forEach((r) => r.addEventListener("click", () => go(`#/edit/${r.dataset.id}`)));
+
+  // 画像
+  const $file = document.getElementById("img-file");
+  document.getElementById("img-pick").addEventListener("click", () => $file.click());
+  $file.addEventListener("change", async () => {
+    const f = $file.files[0];
+    $file.value = "";
+    if (!f) return;
+    try {
+      await setImage(courseId, await shrinkImage(f));
+      renderCourse(courseId);
+    } catch (e) {
+      console.error(e);
+      toast("画像を保存できませんでした");
+    }
+  });
+  const $imgDel = document.getElementById("img-del");
+  if ($imgDel) $imgDel.addEventListener("click", async () => {
+    if (!confirm("このコースの画像を外します。")) return;
+    await setImage(courseId, null);
+    renderCourse(courseId);
+  });
+
+  // 目標タイム
+  const $tIn = document.getElementById("t-in");
+  const $tSave = document.getElementById("t-save");
+  const $tHint = document.getElementById("t-hint");
+  $tIn.addEventListener("input", () => {
+    const ms = parseDigits($tIn.value);
+    $tSave.disabled = ms == null || ms === target;
+    if (!$tIn.value.trim()) $tHint.textContent = target != null ? `いまの目標：${fmt(target)}` : "数字だけ入力（150000 → 1:50.000）";
+    else if (ms == null) $tHint.textContent = "読み取れません（分・秒2桁・1/1000秒3桁の順で数字を入力）";
+    else $tHint.textContent = fmt(ms) + (best ? `　自己ベストとの差 ${fmtDiff(best.timeMs - ms)}` : "");
+  });
+  $tSave.addEventListener("click", () => {
+    const ms = parseDigits($tIn.value);
+    if (ms == null) return;
+    data.targets[`${courseId}|${cc}`] = ms;
+    save();
+    toast(`目標を ${fmt(ms)} にしました`);
+    renderCourse(courseId);
+  });
+  const $tClear = document.getElementById("t-clear");
+  if ($tClear) $tClear.addEventListener("click", () => {
+    delete data.targets[`${courseId}|${cc}`];
+    save();
+    toast("目標を消しました");
+    renderCourse(courseId);
+  });
+
+  // 1コースのリセット（表示中の排気量の記録だけ。目標と画像は残す）
+  const $reset = document.getElementById("reset-course");
+  if ($reset) $reset.addEventListener("click", () => {
+    if (!confirm(`${course.name} の ${cc}cc の記録 ${recs.length}件をすべて消します。元に戻せません。`)) return;
+    if (!confirm("本当に消しますか？（目標タイムと画像は残ります）")) return;
+    data.records = data.records.filter((r) => !(r.courseId === courseId && r.cc === cc));
+    save();
+    toast(`${cc}cc の記録をリセットしました`);
+    renderCourse(courseId);
+  });
 }
 
 function comboText(r) {
@@ -273,9 +492,11 @@ function comboText(r) {
 }
 
 // タイムの推移グラフ。灰色の点＝各記録、金色の線＝その時点までの自己ベスト
-function chartSvg(recs) {
+// 目標タイムがあれば緑の点線で引く
+function chartSvg(recs, target) {
   const W = 340, H = 170, L = 52, R = 10, T = 10, B = 24;
   const times = recs.map((r) => r.timeMs);
+  if (target != null) times.push(target);
   let lo = Math.min(...times), hi = Math.max(...times);
   if (hi - lo < 200) { const mid = (hi + lo) / 2; lo = mid - 100; hi = mid + 100; }
   const pad = (hi - lo) * 0.08;
@@ -299,11 +520,12 @@ function chartSvg(recs) {
 
   return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="タイムの推移">
     ${grid}
+    ${target != null ? `<line x1="${L}" x2="${W - R}" y1="${yy(target).toFixed(1)}" y2="${yy(target).toFixed(1)}" stroke="#4cc38a" stroke-width="1.5" stroke-dasharray="5 4"/>` : ""}
     <polyline points="${pbPts.join(" ")}" fill="none" stroke="#f4c542" stroke-width="2.5" stroke-linejoin="round"/>
     ${dots}
     <text x="${L}" y="${H - 6}" fill="#9aa0ad" font-size="10">${first}</text>
     <text x="${W - R}" y="${H - 6}" fill="#9aa0ad" font-size="10" text-anchor="end">${last}</text>
-  </svg><div class="legend"><span><i style="background:#9aa0ad"></i>各記録</span><span><i style="background:#f4c542"></i>自己ベストの推移</span></div></div>`;
+  </svg><div class="legend"><span><i style="background:#9aa0ad"></i>各記録</span><span><i style="background:#f4c542"></i>自己ベストの推移</span>${target != null ? '<span><i style="background:#4cc38a"></i>目標</span>' : ""}</div></div>`;
 }
 
 /* ---------- 画面：記録の追加・修正 ---------- */
@@ -436,8 +658,10 @@ function renderForm(courseId, recordId) {
     if (!save()) return;
     data.settings.cc = cc;
     save();
-    if (!prevBest) toast(`${cc}cc 初記録 ${fmt(ms)}`, true);
-    else if (ms < prevBest.timeMs) toast(`自己ベスト更新！ ${fmtDiff(ms - prevBest.timeMs)}`, true);
+    const gap = targetGap({ timeMs: ms }, targetOf(courseId, cc));
+    const gapNote = gap != null ? `（${gapText(gap)}）` : "";
+    if (!prevBest) toast(`${cc}cc 初記録 ${fmt(ms)}${gapNote}`, true);
+    else if (ms < prevBest.timeMs) toast(`自己ベスト更新！ 前回から ${fmtDiff(ms - prevBest.timeMs)}${gapNote}`, true);
     else toast("保存しました");
     history.back();
   });
@@ -472,14 +696,26 @@ function renderSettings() {
       <button class="btn primary" id="export">記録を書き出す</button>
       <button class="btn" id="import">書き出したファイルを読み込む</button>
       <input type="file" id="import-file" accept=".json,application/json" hidden>
-      <p class="hint">読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません。</p>
+      <p class="hint">目標タイムとコース画像も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像は、まだ無いコースにだけ入ります）。</p>
     </div>
     <div class="card"><h2>保存の状態</h2><p id="persist">確認中…</p></div>
+    <div class="card"><h2>全コースの記録をリセット</h2>
+      <p>150cc・200cc の記録 ${n} 件をすべて消します。目標タイムとコース画像は残ります。先に書き出しておくと、読み込みで元に戻せます。</p>
+      <button class="btn danger" id="reset-all" ${n ? "" : "disabled"}>全コースの記録をリセット</button>
+    </div>
     <div class="card"><h2>このアプリについて</h2>
       <p>マリオカート8 デラックスのタイムアタック記録用（個人利用）。全96コース・150cc／200cc。</p>
     </div>`;
 
   document.getElementById("export").addEventListener("click", exportData);
+  document.getElementById("reset-all").addEventListener("click", () => {
+    if (!confirm(`全コースの記録 ${n} 件をすべて消します。元に戻せません。`)) return;
+    if (!confirm(`本当に消しますか？${lastExport ? `（最後に書き出したのは ${fmtDate(lastExport)}）` : "（まだ一度も書き出していません）"}`)) return;
+    data.records = [];
+    save();
+    toast("全コースの記録をリセットしました");
+    renderSettings();
+  });
   const $file = document.getElementById("import-file");
   document.getElementById("import").addEventListener("click", () => $file.click());
   $file.addEventListener("change", () => {
@@ -500,7 +736,10 @@ function renderSettings() {
 }
 
 async function exportData() {
-  const payload = JSON.stringify({ app: "mk8ta", version: 1, exportedAt: new Date().toISOString(), records: data.records }, null, 1);
+  const payload = JSON.stringify({
+    app: "mk8ta", version: 1, exportedAt: new Date().toISOString(),
+    records: data.records, targets: data.targets, images,
+  }, null, 1);
   const name = `マリカTA記録_${today()}.json`;
   const file = new File([payload], name, { type: "application/json" });
   try {
@@ -525,10 +764,10 @@ async function exportData() {
 
 function importData(file) {
   const reader = new FileReader();
-  reader.onload = () => {
-    let incoming;
+  reader.onload = async () => {
+    let incoming, d;
     try {
-      const d = JSON.parse(reader.result);
+      d = JSON.parse(reader.result);
       incoming = d.records;
       if (!Array.isArray(incoming)) throw new Error("records がない");
     } catch (e) {
@@ -552,8 +791,23 @@ function importData(file) {
       have.add(r.id);
       added++;
     }
+    // 目標と画像は、まだ無いコースにだけ入れる（今あるものは上書きしない）
+    let tAdded = 0, iAdded = 0;
+    if (d.targets && typeof d.targets === "object") {
+      for (const [k, v] of Object.entries(d.targets)) {
+        const [cid, tcc] = k.split("|");
+        if (!COURSE_BY_ID[cid] || (tcc !== "150" && tcc !== "200") || !Number.isInteger(v) || v <= 0) continue;
+        if (data.targets[k] == null) { data.targets[k] = v; tAdded++; }
+      }
+    }
     save();
-    toast(`${added}件を読み込みました` + (skipped ? `（読めない記録 ${skipped}件は飛ばしました）` : ""));
+    if (d.images && typeof d.images === "object") {
+      for (const [cid, url] of Object.entries(d.images)) {
+        if (!COURSE_BY_ID[cid] || images[cid] || typeof url !== "string" || !url.startsWith("data:image/")) continue;
+        try { await setImage(cid, url); iAdded++; } catch (e) { console.error(e); }
+      }
+    }
+    toast(`${added}件を読み込みました` + (tAdded || iAdded ? `（目標${tAdded}・画像${iAdded}）` : "") + (skipped ? `（読めない記録 ${skipped}件は飛ばしました）` : ""));
     renderSettings();
   };
   reader.readAsText(file);
@@ -577,6 +831,10 @@ $back.addEventListener("click", () => history.back());
 document.getElementById("settings-btn").addEventListener("click", () => go("#/settings"));
 window.addEventListener("hashchange", route);
 route();
+// 画像は読み込みに少し時間がかかるので、読み終えたら今の画面を描き直す（記録の入力中は邪魔しない）
+loadImages()
+  .then(() => { if (Object.keys(images).length && !/^#\/(add|edit)/.test(location.hash)) route(); })
+  .catch((e) => console.error(e));
 
 // 消されにくい保存をお願いする（iPhone ではホーム画面から開いたときに効く）
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
