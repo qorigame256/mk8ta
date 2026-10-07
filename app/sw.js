@@ -1,6 +1,9 @@
 // サービスワーカー（＝電波がなくてもアプリを開けるよう、画面のファイルを iPhone に取っておく仕組み）。
 // 取っておいた版をすぐ表示し、裏で最新版を取りに行く。更新は「次に開いたとき」に反映される。
-const CACHE = "mk8ta-v1";
+// 同じ住所（qorigame256.github.io）にはほかのアプリも同居し、取っておく場所を共有している。
+// 消すのも横取りするのも、名前が mk8ta- で始まるもの・/mk8ta/ の下だけに限る（ほかのアプリの圏外用を消さないため）。
+const PREFIX = "mk8ta-";
+const CACHE = PREFIX + "v2";
 const FILES = [
   "./",
   "index.html",
@@ -20,13 +23,13 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith(PREFIX) && k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
 
 self.addEventListener("fetch", (e) => {
-  if (e.request.method !== "GET" || new URL(e.request.url).origin !== location.origin) return;
+  if (e.request.method !== "GET" || !e.request.url.startsWith(self.registration.scope)) return;
   e.respondWith(
     caches.open(CACHE).then(async (cache) => {
       const cached = await cache.match(e.request, { ignoreSearch: true });
