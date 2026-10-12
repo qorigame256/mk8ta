@@ -18,13 +18,14 @@ function loadData() {
         if (!d.targetLaps || typeof d.targetLaps !== "object") d.targetLaps = {};
         if (!Array.isArray(d.battles)) d.battles = [];
         if (!Array.isArray(d.pickExclude)) d.pickExclude = [];
+        if (!d.difficulty || typeof d.difficulty !== "object") d.difficulty = {};
         return d;
       }
     }
   } catch (e) {
     console.error(e);
   }
-  return { version: 1, records: [], targets: {}, targetLaps: {}, battles: [], pickExclude: [], settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
+  return { version: 1, records: [], targets: {}, targetLaps: {}, battles: [], pickExclude: [], difficulty: {}, settings: { cc: "150", scope: "all", sort: "cup", pick: "random" } };
 }
 
 let data = loadData();
@@ -62,6 +63,49 @@ function lapGapText(laps, tLaps) {
     else parts.push("—");
   }
   return any ? parts.join(" / ") : "";
+}
+
+/* ---------- コースの難易度 ---------- */
+// コース×排気量ごとに3つの軸を星1〜5で付ける。キーは目標タイムと同じ "c01|150"、
+// 値は { all: 3, learn: 2, charge: 4 }（付けていない軸は持たない。全部消したらキーごと消す）
+
+const DIFF_AXES = [
+  ["all", "総合難易度"],
+  ["learn", "コース理解"],
+  ["charge", "早溜め要求"],
+];
+
+function diffOf(courseId, cc) {
+  return data.difficulty[`${courseId}|${cc}`] ?? null;
+}
+
+// 星を押したときの保存。今と同じ星を押したら、その軸を未設定に戻す
+function toggleDiff(courseId, cc, axis, n) {
+  const key = `${courseId}|${cc}`;
+  const d = Object.assign({}, data.difficulty[key]);
+  if (d[axis] === n) delete d[axis];
+  else d[axis] = n;
+  if (Object.keys(d).length) data.difficulty[key] = d;
+  else delete data.difficulty[key];
+  return save();
+}
+
+function starsText(n) {
+  return "★".repeat(n) + "☆".repeat(5 - n);
+}
+
+// 3軸ぶんの星のボタン。押したときの処理は bindDiffStars で付ける
+function diffStarRows(courseId, cc) {
+  const d = diffOf(courseId, cc) || {};
+  return DIFF_AXES.map(([axis, label]) => `<div class="diff-axis"><span class="diff-label">${label}</span><span class="stars">${
+    [1, 2, 3, 4, 5].map((n) => `<button class="star ${d[axis] >= n ? "on" : ""}" data-c="${courseId}" data-axis="${axis}" data-n="${n}" aria-label="${label} 星${n}">${d[axis] >= n ? "★" : "☆"}</button>`).join("")
+  }</span></div>`).join("");
+}
+
+function bindDiffStars($root, cc, after) {
+  $root.querySelectorAll(".star").forEach((b) => b.addEventListener("click", () => {
+    if (toggleDiff(b.dataset.c, cc, b.dataset.axis, Number(b.dataset.n))) after(b.dataset.c);
+  }));
 }
 
 /* ---------- 対戦の評価 ---------- */
@@ -339,6 +383,7 @@ function renderHome() {
   $view.innerHTML = `<div class="toolbar">${ccSwitch()}</div>
     <button class="btn pick-btn" id="pick-btn">🎲 おまかせで次のコースを決める</button>
     <button class="btn pick-btn" id="battle-btn">⚔ 対戦の記録・練習すべきコース</button>
+    <button class="btn pick-btn" id="diff-btn">★ コースの難易度をまとめて付ける</button>
     <div class="toolbar"><div class="seg" id="scope-seg">
       <button data-v="all" class="${scope === "all" ? "on" : ""}">すべて</button>
       <button data-v="done" class="${scope === "done" ? "on" : ""}">記録あり</button>
@@ -357,6 +402,7 @@ function renderHome() {
     go("#/pick");
   });
   document.getElementById("battle-btn").addEventListener("click", () => go("#/battle"));
+  document.getElementById("diff-btn").addEventListener("click", () => go("#/difficulty"));
   for (const [id, key] of [["scope-seg", "scope"], ["sort-seg", "sort"]]) {
     document.querySelectorAll(`#${id} button`).forEach((b) =>
       b.addEventListener("click", () => {
@@ -395,7 +441,8 @@ function renderHomeList() {
 
   const row = (c, withCup) => {
     const { best, n, gap } = info[c.id];
-    const sub = [withCup ? esc(c.cup) : "", n ? `${n}件` : ""].filter(Boolean).join("・");
+    const dAll = diffOf(c.id, cc)?.all;
+    const sub = [withCup ? esc(c.cup) : "", n ? `${n}件` : "", dAll ? `<span class="diff-mini">${starsText(dAll)}</span>` : ""].filter(Boolean).join("・");
     return `<button class="row" data-id="${c.id}">
       ${images[c.id] ? `<img class="thumb" src="${images[c.id]}" alt="">` : ""}
       <span class="name">${courseLabel(c.name)}${sub ? `<small>${sub}</small>` : ""}</span>
@@ -611,6 +658,56 @@ function renderExcludeList() {
   }));
 }
 
+/* ---------- 画面：難易度をまとめて付ける ---------- */
+// カップ順の全96コースに3軸の星を並べ、押した時点で保存する。排気量は表示中のもの（切り替え可）。
+
+let diffSearch = "";
+
+function renderDifficulty() {
+  $title.textContent = "コースの難易度";
+  $back.hidden = false;
+  $view.innerHTML = `<div class="toolbar">${ccSwitch()}</div>
+    <p class="summary">星を押すと保存します。同じ星をもう一度押すと未設定に戻ります。</p>
+    <div class="search"><input id="diff-search" class="input" type="search" placeholder="コース名で検索" autocomplete="off" value="${esc(diffSearch)}"></div>
+    <p class="summary" id="diff-count"></p>
+    <div id="diff-list"></div>`;
+  bindCcSwitch(renderDifficulty);
+  document.getElementById("diff-search").addEventListener("input", (e) => {
+    diffSearch = e.target.value;
+    renderDifficultyList();
+  });
+  renderDifficultyList();
+}
+
+function diffCountText(cc) {
+  const n = COURSES.filter((c) => diffOf(c.id, cc)).length;
+  return `${cc}cc：${COURSES.length}コース中 ${n}コースに難易度あり`;
+}
+
+function renderDifficultyList() {
+  const cc = data.settings.cc;
+  document.getElementById("diff-count").textContent = diffCountText(cc);
+  const q = norm(diffSearch);
+  const shown = COURSES.filter((c) => !q || norm(c.name).includes(q) || norm(c.cup).includes(q));
+  const item = (c) => `<div class="row diff-row" data-id="${c.id}"><span class="name">${courseLabel(c.name)}</span>${diffStarRows(c.id, cc)}</div>`;
+  let html = "";
+  for (const cup of CUPS) {
+    const rows = shown.filter((c) => c.cup === cup.name);
+    if (rows.length) html += `<section class="cup"><h2>${esc(cup.name)}${cup.dlc ? '<span class="dlc">追加</span>' : ""}</h2><div class="list">${rows.map(item).join("")}</div></section>`;
+  }
+  if (!shown.length) html = `<p class="empty">見つかりません</p>`;
+  const $list = document.getElementById("diff-list");
+  $list.innerHTML = html;
+  // 押したコースの行だけ描き直す（一覧全体を描き直すとスクロール位置や検索欄の入力が崩れるため）
+  const redraw = (id) => {
+    const $row = $list.querySelector(`.diff-row[data-id="${id}"]`);
+    $row.outerHTML = item(COURSE_BY_ID[id]);
+    bindDiffStars($list.querySelector(`.diff-row[data-id="${id}"]`), cc, redraw);
+    document.getElementById("diff-count").textContent = diffCountText(cc);
+  };
+  bindDiffStars($list, cc, redraw);
+}
+
 /* ---------- 画面：対戦の記録 ---------- */
 // 「入力」：コースをタップ → 下から出る評価ボタンを押した時点で保存。続けて次のコースへ。
 // 「練習すべきコース」：直近5回の合計がマイナスのコースを苦手な順に。
@@ -808,6 +905,7 @@ function renderCourse(courseId) {
       <button type="button" class="btn small" id="t-add-lap" style="margin-top:8px">＋ ラップ欄を増やす</button>
     </details></div>`;
 
+  html += `<div class="card" id="course-diff"></div>`;
   html += `<div class="card" id="course-battle"></div>`;
 
   if (recs.length >= 2) html += chartSvg(recs, target);
@@ -832,6 +930,7 @@ function renderCourse(courseId) {
   $view.innerHTML = html;
 
   bindCcSwitch(() => renderCourse(courseId));
+  renderCourseDiff(courseId);
   renderCourseBattle(courseId);
   document.getElementById("add").addEventListener("click", () => go(`#/add/${courseId}`));
   $view.querySelectorAll(".rec").forEach((r) => r.addEventListener("click", () => go(`#/edit/${r.dataset.id}`)));
@@ -942,6 +1041,15 @@ function renderCourse(courseId) {
     toast(`${cc}cc の記録をリセットしました`);
     renderCourse(courseId);
   });
+}
+
+// コース画面の「難易度」の枠。押すたびにこの枠だけ描き直す（目標タイムの入力中の値を崩さないため）
+function renderCourseDiff(courseId) {
+  const cc = data.settings.cc;
+  const $box = document.getElementById("course-diff");
+  $box.innerHTML = `<h2>${cc}cc 難易度</h2>${diffStarRows(courseId, cc)}
+    <p class="hint">星を押すと保存します。同じ星をもう一度押すと未設定に戻ります</p>`;
+  bindDiffStars($box, cc, () => renderCourseDiff(courseId));
 }
 
 // コース画面の「対戦の評価」の枠。ここからも評価を付けられ、今日付けた分は消せる。
@@ -1205,11 +1313,11 @@ function renderSettings() {
       <button class="btn primary" id="export">記録を書き出す</button>
       <button class="btn" id="import">書き出したファイルを読み込む</button>
       <input type="file" id="import-file" accept=".json,application/json" hidden>
-      <p class="hint">目標タイム（目標ラップを含む）・コース画像・対戦の評価も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像は、まだ無いコースにだけ入ります）。</p>
+      <p class="hint">目標タイム（目標ラップを含む）・コース画像・対戦の評価・難易度も一緒に書き出します。読み込みは「足し合わせ」です。今ある記録は消えず、同じ記録は二重になりません（目標・画像・難易度は、まだ無いコースにだけ入ります）。</p>
     </div>
     <div class="card"><h2>保存の状態</h2><p id="persist">確認中…</p></div>
     <div class="card"><h2>全コースの記録をリセット</h2>
-      <p>150cc・200cc の記録 ${n} 件をすべて消します。目標タイム・コース画像・対戦の評価は残ります。先に書き出しておくと、読み込みで元に戻せます。</p>
+      <p>150cc・200cc の記録 ${n} 件をすべて消します。目標タイム・コース画像・対戦の評価・難易度は残ります。先に書き出しておくと、読み込みで元に戻せます。</p>
       <button class="btn danger" id="reset-all" ${n ? "" : "disabled"}>全コースの記録をリセット</button>
     </div>
     <div class="card"><h2>このアプリについて</h2>
@@ -1247,7 +1355,7 @@ function renderSettings() {
 async function exportData() {
   const payload = JSON.stringify({
     app: "mk8ta", version: 1, exportedAt: new Date().toISOString(),
-    records: data.records, targets: data.targets, targetLaps: data.targetLaps, battles: data.battles, pickExclude: data.pickExclude, images,
+    records: data.records, targets: data.targets, targetLaps: data.targetLaps, battles: data.battles, pickExclude: data.pickExclude, difficulty: data.difficulty, images,
   }, null, 1);
   const name = `マリカTA記録_${today()}.json`;
   const file = new File([payload], name, { type: "application/json" });
@@ -1327,6 +1435,16 @@ function importData(file) {
         if (data.targets[k] == null) { data.targets[k] = v; tAdded++; }
       }
     }
+    // 難易度も、まだ付けていないコース×排気量にだけ入れる（今あるものは上書きしない）
+    if (d.difficulty && typeof d.difficulty === "object") {
+      for (const [k, v] of Object.entries(d.difficulty)) {
+        const [cid, dcc] = k.split("|");
+        if (!COURSE_BY_ID[cid] || (dcc !== "150" && dcc !== "200") || data.difficulty[k] || !v || typeof v !== "object") continue;
+        const ok = {};
+        for (const [axis] of DIFF_AXES) if (Number.isInteger(v[axis]) && v[axis] >= 1 && v[axis] <= 5) ok[axis] = v[axis];
+        if (Object.keys(ok).length) data.difficulty[k] = ok;
+      }
+    }
     // 目標ラップも、まだ無いものだけ入れる（ファイルと今の目標タイムが同じものに限る。別の目標にラップだけ付くのを防ぐ）
     if (d.targetLaps && typeof d.targetLaps === "object" && d.targets && typeof d.targets === "object") {
       for (const [k, v] of Object.entries(d.targetLaps)) {
@@ -1361,6 +1479,7 @@ function route() {
     case "pick": return renderPick();
     case "exclude": return renderExclude();
     case "battle": return renderBattle();
+    case "difficulty": return renderDifficulty();
     default: return renderHome();
   }
 }
