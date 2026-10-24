@@ -208,12 +208,14 @@ function loadImg(src) {
   });
 }
 
-// 画像の大きさと位置を決める画面。16:9 の枠に見えている部分だけを 640×360 の JPEG（画質 0.8）にして返す。
-// 指1本で動かす・2本指で拡大縮小（スライダーとパソコンのホイールでも）。いちばん小さくて枠いっぱい（すき間は作らない）。
+// 画像の大きさ・位置・比率を決める画面。金色の枠の中に見えている部分だけを JPEG（画質 0.8、長い辺 640px）にして返す。
+// 画像：指1本で動かす・2本指で拡大縮小（スライダーとパソコンのホイールでも）。枠より小さくしてよく、すき間は黒で保存する。
+// 枠：四隅を指で引っぱって形（比率）を変える。ratio を渡すとその比率の枠で始め（新しい写真は 16:9）、
+// 渡さなければ画像そのものの比率で始める（今の画像から決め直すとき、何もせず決定すれば同じ画像に戻るように）。
 // やめたら null。src は File か data URL。
-const CROP_W = 640, CROP_H = 360, CROP_MAX = 5;
+const CROP_LONG = 640, CROP_MIN_BOX = 40, CROP_ZOOM = 5; // 長い辺の px／枠の最小の辺（画面 px）／拡大縮小の幅（最初の何分の1〜何倍）
 
-async function cropImage(src) {
+async function cropImage(src, ratio) {
   const url = typeof src === "string" ? src : URL.createObjectURL(src);
   let img;
   try { img = await loadImg(url); } finally { if (url !== src) URL.revokeObjectURL(url); }
@@ -222,89 +224,137 @@ async function cropImage(src) {
   const $box = document.createElement("div");
   $box.className = "crop";
   $box.setAttribute("role", "dialog");
-  $box.setAttribute("aria-label", "画像の大きさと位置");
+  $box.setAttribute("aria-label", "画像の大きさ・位置・比率");
   $box.innerHTML = `<div class="crop-in">
-      <p class="crop-title">画像の大きさと位置</p>
-      <div class="crop-frame"></div>
-      <p class="hint">指で動かす・2本指で広げると大きくなります。枠の中だけが保存されます</p>
-      <label class="crop-zoom"><span>小</span><input type="range" min="1" max="${CROP_MAX}" step="0.01" value="1" aria-label="大きさ"><span>大</span></label>
+      <p class="crop-title">画像の大きさ・位置・比率</p>
+      <div class="crop-stage"><div class="crop-rect">${["tl", "tr", "bl", "br"].map((c) => `<span class="crop-h ${c}" data-c="${c}"></span>`).join("")}</div></div>
+      <p class="hint">金色の枠の中だけが保存されます。枠の角を引っぱると形が変わります。画像は指で動かし、2本指で広げると大きくなります</p>
+      <label class="crop-zoom"><span>小</span><input type="range" min="${-Math.log(CROP_ZOOM)}" max="${Math.log(CROP_ZOOM)}" step="0.01" value="0" aria-label="大きさ"><span>大</span></label>
+      <div class="crop-tools"><span class="crop-ratio"></span><button class="btn small" data-act="wide">枠を 16:9 にする</button></div>
       <button class="btn primary" data-act="ok">決定</button>
       <button class="btn" data-act="cancel">やめる</button>
     </div>`;
-  const $frame = $box.querySelector(".crop-frame");
+  const $stage = $box.querySelector(".crop-stage");
+  const $rect = $box.querySelector(".crop-rect");
   const $zoom = $box.querySelector("input");
+  const $ratio = $box.querySelector(".crop-ratio");
   img.className = "crop-img";
   img.alt = "";
   img.draggable = false;
-  $frame.appendChild(img);
+  $stage.prepend(img);
   document.body.appendChild($box);
 
-  // 状態は「枠の真ん中に来る画像上の点（cx, cy：元画像の px）」と「拡大率 z（1＝枠いっぱい）」で持つ。
-  // 枠の大きさが変わっても（画面の回転など）同じ見え方を保てるようにするため。
-  let cx = iw / 2, cy = ih / 2, z = 1;
-  const size = () => ({ W: $frame.clientWidth, H: $frame.clientHeight });
-  const kOf = (W, H, zz) => Math.max(W / iw, H / ih) * zz; // 画面 px ÷ 元画像 px
-  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-  function draw() {
-    const { W, H } = size();
-    const k = kOf(W, H, z);
-    cx = clamp(cx, W / 2 / k, iw - W / 2 / k);
-    cy = clamp(cy, H / 2 / k, ih - H / 2 / k);
-    img.style.width = `${iw * k}px`;
-    img.style.height = `${ih * k}px`;
-    img.style.transform = `translate(${W / 2 - cx * k}px, ${H / 2 - cy * k}px)`;
-    $zoom.value = z;
-  }
-  // 枠の中の点 (mx, my) の下にある画像の点を、拡大率を z2 に変えたあと (mx2, my2) に持ってくる
-  function moveZoom(mx, my, mx2, my2, z2) {
-    const { W, H } = size();
-    const k = kOf(W, H, z);
-    const px = cx + (mx - W / 2) / k, py = cy + (my - H / 2) / k;
-    z = clamp(z2, 1, CROP_MAX);
-    const k2 = kOf(W, H, z);
-    cx = px - (mx2 - W / 2) / k2;
-    cy = py - (my2 - H / 2) / k2;
+  // 位置と大きさはすべて台（.crop-stage）の左上からの画面 px で持つ。
+  // 枠 r = { x, y, w, h }、画像は左上 (ix, iy) と倍率 k（画面 px ÷ 元画像 px）。k0 は始めの倍率（スライダーの真ん中）
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+  let SW = $stage.clientWidth, SH = $stage.clientHeight;
+  let r, ix, iy, k, k0;
+  // 台の中に収まるいちばん大きい、比率 q（横÷縦）の枠を真ん中に置き、画像を枠いっぱい（すき間なし）に合わせる
+  function reset(q) {
+    const pad = 12;
+    const w = Math.min(SW - pad * 2, (SH - pad * 2) * q);
+    r = { w, h: w / q, x: (SW - w) / 2, y: 0 };
+    r.y = (SH - r.h) / 2;
+    k = k0 = Math.max(r.w / iw, r.h / ih);
+    ix = r.x + (r.w - iw * k) / 2;
+    iy = r.y + (r.h - ih * k) / 2;
     draw();
   }
+  function draw() {
+    // 画像が枠から離れて見えなくならないよう、少なくとも m px は枠に重ねておく
+    const m = Math.min(24, iw * k / 2, ih * k / 2, r.w / 2, r.h / 2);
+    ix = clamp(ix, r.x + m - iw * k, r.x + r.w - m);
+    iy = clamp(iy, r.y + m - ih * k, r.y + r.h - m);
+    img.style.width = `${iw * k}px`;
+    img.style.height = `${ih * k}px`;
+    img.style.transform = `translate(${ix}px, ${iy}px)`;
+    Object.assign($rect.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px` });
+    $zoom.value = Math.log(k / k0);
+    $ratio.textContent = `比率 ${ratioText(r.w / r.h)}`;
+  }
+  // 台の上の点 (mx, my) の下にある画像の点を、倍率を k2 に変えたあと (mx2, my2) に持ってくる
+  function moveZoom(mx, my, mx2, my2, k2) {
+    const px = (mx - ix) / k, py = (my - iy) / k;
+    k = clamp(k2, k0 / CROP_ZOOM, k0 * CROP_ZOOM);
+    ix = mx2 - px * k;
+    iy = my2 - py * k;
+    draw();
+  }
+  const local = (e) => { const b = $stage.getBoundingClientRect(); return { x: e.clientX - b.left, y: e.clientY - b.top }; };
 
-  // 指（とマウス）の動き。押している指を全部覚えておき、1本なら移動、2本なら2本の中点と間隔で移動＋拡大縮小
+  // 画像を動かす。押している指を全部覚えておき、1本なら移動、2本なら2本の中点と間隔で移動＋拡大縮小
   const pts = new Map();
-  const local = (e) => { const r = $frame.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
   const gesture = () => {
     const a = [...pts.values()];
     if (a.length === 1) return { x: a[0].x, y: a[0].y, d: 0 };
     return { x: (a[0].x + a[1].x) / 2, y: (a[0].y + a[1].y) / 2, d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) };
   };
-  $frame.addEventListener("pointerdown", (e) => {
+  $stage.addEventListener("pointerdown", (e) => {
     if (pts.size >= 2) return;
     pts.set(e.pointerId, local(e));
-    try { $frame.setPointerCapture(e.pointerId); } catch {} // 枠の外へ指が出ても追い続けるため（できなくても動かせる）
+    try { $stage.setPointerCapture(e.pointerId); } catch {} // 台の外へ指が出ても追い続けるため（できなくても動かせる）
   });
-  $frame.addEventListener("pointermove", (e) => {
+  $stage.addEventListener("pointermove", (e) => {
     if (!pts.has(e.pointerId)) return;
     const g0 = gesture();
     pts.set(e.pointerId, local(e));
     const g1 = gesture();
-    moveZoom(g0.x, g0.y, g1.x, g1.y, g0.d && g1.d ? z * (g1.d / g0.d) : z);
+    moveZoom(g0.x, g0.y, g1.x, g1.y, g0.d && g1.d ? k * (g1.d / g0.d) : k);
   });
   const up = (e) => pts.delete(e.pointerId);
-  $frame.addEventListener("pointerup", up);
-  $frame.addEventListener("pointercancel", up);
-  $frame.addEventListener("wheel", (e) => {
+  $stage.addEventListener("pointerup", up);
+  $stage.addEventListener("pointercancel", up);
+  $stage.addEventListener("wheel", (e) => {
     e.preventDefault();
     const p = local(e);
-    moveZoom(p.x, p.y, p.x, p.y, z * Math.exp(-e.deltaY / 500));
+    moveZoom(p.x, p.y, p.x, p.y, k * Math.exp(-e.deltaY / 500));
   }, { passive: false });
   $zoom.addEventListener("input", () => {
-    const { W, H } = size();
-    moveZoom(W / 2, H / 2, W / 2, H / 2, Number($zoom.value));
+    const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    moveZoom(cx, cy, cx, cy, k0 * Math.exp(Number($zoom.value)));
   });
-  window.addEventListener("resize", draw);
-  draw();
+
+  // 枠の角を引っぱる。向かいの角は動かさず、台からはみ出さない・最小の辺より小さくしない
+  $rect.querySelectorAll(".crop-h").forEach(($h) => {
+    let grab = null; // { id, dx, dy }：押した点と角のずれ（角をつまんだ位置のまま追うため）
+    $h.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+      const p = local(e), c = $h.dataset.c;
+      grab = { id: e.pointerId, dx: (c[1] === "l" ? r.x : r.x + r.w) - p.x, dy: (c[0] === "t" ? r.y : r.y + r.h) - p.y };
+      try { $h.setPointerCapture(e.pointerId); } catch {}
+    });
+    $h.addEventListener("pointermove", (e) => {
+      if (!grab || grab.id !== e.pointerId) return;
+      e.stopPropagation();
+      const p = local(e), c = $h.dataset.c;
+      const x = clamp(p.x + grab.dx, 0, SW), y = clamp(p.y + grab.dy, 0, SH);
+      let x1 = r.x, y1 = r.y, x2 = r.x + r.w, y2 = r.y + r.h;
+      if (c[1] === "l") x1 = Math.min(x, x2 - CROP_MIN_BOX); else x2 = Math.max(x, x1 + CROP_MIN_BOX);
+      if (c[0] === "t") y1 = Math.min(y, y2 - CROP_MIN_BOX); else y2 = Math.max(y, y1 + CROP_MIN_BOX);
+      r = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+      draw();
+    });
+    const end = (e) => { if (grab && grab.id === e.pointerId) grab = null; };
+    $h.addEventListener("pointerup", end);
+    $h.addEventListener("pointercancel", end);
+  });
+  $box.querySelector('[data-act="wide"]').addEventListener("click", () => reset(16 / 9));
+
+  // 画面の大きさが変わったら（回転など）、全部を同じ割合で縮め・伸ばす
+  const onResize = () => {
+    const s = $stage.clientWidth / SW;
+    if (!s || s === 1) return;
+    SW = $stage.clientWidth; SH = $stage.clientHeight;
+    r = { x: r.x * s, y: r.y * s, w: r.w * s, h: r.h * s };
+    ix *= s; iy *= s; k *= s; k0 *= s;
+    draw();
+  };
+  window.addEventListener("resize", onResize);
+  reset(ratio || iw / ih);
 
   return new Promise((resolve) => {
     const close = (result) => {
-      window.removeEventListener("resize", draw);
+      window.removeEventListener("resize", onResize);
       window.removeEventListener("hashchange", onLeave);
       $box.remove();
       resolve(result);
@@ -314,15 +364,25 @@ async function cropImage(src) {
     window.addEventListener("hashchange", onLeave);
     $box.querySelector('[data-act="cancel"]').addEventListener("click", () => close(null));
     $box.querySelector('[data-act="ok"]').addEventListener("click", () => {
-      const { W, H } = size();
-      const k = kOf(W, H, z);
+      const s = CROP_LONG / Math.max(r.w, r.h); // 画面 px → 保存する画像の px
       const c = document.createElement("canvas");
-      c.width = CROP_W;
-      c.height = CROP_H;
-      c.getContext("2d").drawImage(img, cx - W / 2 / k, cy - H / 2 / k, W / k, H / k, 0, 0, CROP_W, CROP_H);
+      c.width = Math.round(r.w * s);
+      c.height = Math.round(r.h * s);
+      const g = c.getContext("2d");
+      g.fillStyle = "#000";
+      g.fillRect(0, 0, c.width, c.height);
+      g.drawImage(img, (ix - r.x) * s, (iy - r.y) * s, iw * k * s, ih * k * s);
       close(c.toDataURL("image/jpeg", 0.8));
     });
   });
+}
+
+// 横÷縦 → "16:9" のような表示。よく使う比率に近ければその名前、そうでなければ「1.85:1」の形
+function ratioText(q) {
+  const named = [[16, 9], [4, 3], [3, 2], [1, 1], [2, 3], [3, 4], [9, 16]];
+  const hit = named.find(([a, b]) => Math.abs(q / (a / b) - 1) < 0.02);
+  if (hit) return `${hit[0]}:${hit[1]}`;
+  return q >= 1 ? `${q.toFixed(2)}:1` : `1:${(1 / q).toFixed(2)}`;
 }
 
 /* ---------- タイムの変換 ---------- */
@@ -1110,10 +1170,10 @@ function renderCourse(courseId) {
   document.getElementById("add").addEventListener("click", () => go(`#/add/${courseId}`));
   $view.querySelectorAll(".rec").forEach((r) => r.addEventListener("click", () => go(`#/edit/${r.dataset.id}`)));
 
-  // 画像（選んだら大きさと位置を決める画面を出す。今の画像から決め直すこともできる）
-  const cropAndSave = async (src) => {
+  // 画像（選んだら大きさ・位置・比率を決める画面を出す。新しい写真は 16:9 の枠で始め、今の画像から決め直すときはその比率で始める）
+  const cropAndSave = async (src, ratio) => {
     try {
-      const url = await cropImage(src);
+      const url = await cropImage(src, ratio);
       if (!url) return;
       await setImage(courseId, url);
       renderCourse(courseId);
@@ -1127,7 +1187,7 @@ function renderCourse(courseId) {
   $file.addEventListener("change", () => {
     const f = $file.files[0];
     $file.value = "";
-    if (f) cropAndSave(f);
+    if (f) cropAndSave(f, 16 / 9);
   });
   const $imgCrop = document.getElementById("img-crop");
   if ($imgCrop) $imgCrop.addEventListener("click", () => cropAndSave(images[courseId]));
