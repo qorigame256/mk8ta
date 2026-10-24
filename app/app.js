@@ -370,37 +370,93 @@ function bindCcSwitch(rerender) {
   );
 }
 
+/* ---------- 総合得点 ---------- */
+// 目標タイム基準。1コース100点満点：目標達成で100点、目標まで1秒遅いごとに10点減る（10秒以上遅いと0点）。
+// 目標か記録の無いコースは0点で、表示中の排気量の全96コースを足す（最高9,600点）。
+// 1/1000秒の差＝0.01点なので、小数の誤差が出ないよう「0.01点＝1」の整数で数える。
+
+const SCORE_FULL = 10000; // 1コースの満点（100.00点）
+
+// 目標との差（ms。0以下＝達成）→ そのコースの点
+function pointsOf(gap) {
+  return Math.max(0, SCORE_FULL - Math.max(gap, 0));
+}
+
+// 0.01点単位の整数 → "5,432.17"
+function fmtPoints(p) {
+  return `${Math.floor(p / 100).toLocaleString("ja-JP")}.${String(p % 100).padStart(2, "0")}`;
+}
+
+function totalScore(cc) {
+  const t = { points: 0, recorded: 0, targeted: 0, scored: 0, achieved: 0 };
+  for (const c of COURSES) {
+    const best = bestOf(recordsOf(c.id, cc));
+    const target = targetOf(c.id, cc);
+    if (best) t.recorded++;
+    if (target != null) t.targeted++;
+    const gap = targetGap(best, target);
+    if (gap == null) continue;
+    t.scored++;
+    t.points += pointsOf(gap);
+    if (gap <= 0) t.achieved++;
+  }
+  return t;
+}
+
 /* ---------- 画面：コース一覧 ---------- */
 
 let searchText = ""; // 検索欄の文字（アプリを閉じるまで覚えておく）
 
+const SCOPES = [["all", "すべて"], ["done", "記録あり"], ["todo", "未記録"]];
+const SORTS = [["cup", "カップ順"], ["target", "目標に近い順"]];
+
+// 「☰ 表示・メニュー」のボタンの中身。今の表示を添え、絞り込み中（すべて以外）は目立たせる
+function menuBtnHtml() {
+  const { scope, sort } = data.settings;
+  const label = (opts, v) => (opts.find((o) => o[0] === v) || opts[0])[1];
+  return `☰ 表示・メニュー<span class="menu-state ${scope === "done" || scope === "todo" ? "on" : ""}">${label(SCOPES, scope)}・${label(SORTS, sort)}</span>`;
+}
+
 function renderHome() {
   $title.textContent = "マリカTA記録";
   $back.hidden = true;
-  const scope = data.settings.scope; // all / done / todo
-  const sort = data.settings.sort; // cup / target
+  const cc = data.settings.cc;
+  const sc = totalScore(cc);
+  const seg = (id, key, opts) => `<div class="seg" id="${id}">${opts.map(([v, label]) =>
+    `<button data-v="${v}" class="${data.settings[key] === v ? "on" : ""}">${label}</button>`).join("")}</div>`;
 
   $view.innerHTML = `<div class="toolbar">${ccSwitch()}</div>
+    <div class="score-card">
+      <div class="sc-head"><span class="label">${cc}cc 総合得点</span>
+        <span class="sc-val">${fmtPoints(sc.points)}<small>／${(COURSES.length * 100).toLocaleString("ja-JP")}点</small></span></div>
+      <div class="sc-sub">記録あり ${sc.recorded}/${COURSES.length}・目標あり ${sc.targeted}・達成 ${sc.achieved}</div>
+      ${sc.scored ? "" : `<div class="sc-sub">目標タイムを決めたコースに記録が入ると点が付きます（1コース100点満点）</div>`}
+    </div>
     <button class="btn pick-btn" id="pick-btn">🎲 おまかせで次のコースを決める</button>
-    <button class="btn pick-btn" id="battle-btn">⚔ 対戦の記録・練習すべきコース</button>
-    <button class="btn pick-btn" id="diff-btn">★ コースの難易度をまとめて付ける</button>
-    <div class="toolbar"><div class="seg" id="scope-seg">
-      <button data-v="all" class="${scope === "all" ? "on" : ""}">すべて</button>
-      <button data-v="done" class="${scope === "done" ? "on" : ""}">記録あり</button>
-      <button data-v="todo" class="${scope === "todo" ? "on" : ""}">未記録</button>
-    </div></div>
-    <div class="toolbar"><div class="seg" id="sort-seg">
-      <button data-v="cup" class="${sort === "cup" ? "on" : ""}">カップ順</button>
-      <button data-v="target" class="${sort === "target" ? "on" : ""}">目標に近い順</button>
-    </div></div>
+    <button class="btn pick-btn menu-btn" id="menu-btn">${menuBtnHtml()}</button>
     <div class="search"><input id="search" class="input" type="search" placeholder="コース名で検索" autocomplete="off" value="${esc(searchText)}"></div>
-    <div id="home-list"></div>`;
+    <div id="home-list"></div>
+    <div class="sheet-bg" id="menu-bg" hidden></div>
+    <div class="sheet" id="menu-sheet" role="dialog" aria-label="表示・メニュー" hidden>
+      <button class="btn pick-btn" id="battle-btn">⚔ 対戦の記録・練習すべきコース</button>
+      <button class="btn pick-btn" id="diff-btn">★ コースの難易度をまとめて付ける</button>
+      <div class="sheet-label">表示するコース</div>${seg("scope-seg", "scope", SCOPES)}
+      <div class="sheet-label">並び順</div>${seg("sort-seg", "sort", SORTS)}
+      <button class="btn" id="menu-close">閉じる</button>
+    </div>`;
 
   bindCcSwitch(renderHome);
   document.getElementById("pick-btn").addEventListener("click", () => {
     pickedId = null; // 一覧から入るたびに新しく選ぶ
     go("#/pick");
   });
+  // メニューの板。中で表示を切り替えても板は閉じず、後ろの一覧だけ描き直す（続けてもう一方も変えられるように）
+  const $menu = document.getElementById("menu-sheet");
+  const $menuBg = document.getElementById("menu-bg");
+  const showMenu = (open) => { $menu.hidden = !open; $menuBg.hidden = !open; };
+  document.getElementById("menu-btn").addEventListener("click", () => showMenu(true));
+  $menuBg.addEventListener("click", () => showMenu(false));
+  document.getElementById("menu-close").addEventListener("click", () => showMenu(false));
   document.getElementById("battle-btn").addEventListener("click", () => go("#/battle"));
   document.getElementById("diff-btn").addEventListener("click", () => go("#/difficulty"));
   for (const [id, key] of [["scope-seg", "scope"], ["sort-seg", "sort"]]) {
@@ -408,7 +464,9 @@ function renderHome() {
       b.addEventListener("click", () => {
         data.settings[key] = b.dataset.v;
         save();
-        renderHome();
+        document.querySelectorAll(`#${id} button`).forEach((x) => x.classList.toggle("on", x === b));
+        document.getElementById("menu-btn").innerHTML = menuBtnHtml();
+        renderHomeList();
       })
     );
   }
@@ -425,12 +483,10 @@ function renderHomeList() {
   const scope = data.settings.scope;
   const q = norm(searchText);
 
-  let doneCount = 0;
   const info = {};
   for (const c of COURSES) {
     const recs = recordsOf(c.id, cc);
     const best = bestOf(recs);
-    if (best) doneCount++;
     info[c.id] = { best, n: recs.length, gap: targetGap(best, targetOf(c.id, cc)) };
   }
 
@@ -439,21 +495,28 @@ function renderHomeList() {
     (!q || norm(c.name).includes(q) || norm(c.cup).includes(q))
   );
 
-  const row = (c, withCup) => {
+  // 1コース＝1マスで横に4つ並べる。gapRow は目標との差の行を取るか（同じまとまりのどれかに差があれば
+  // 差の無いマスにも空の行を取り、自己ベストの高さを横でそろえる）
+  const tile = (c, withCup, gapRow) => {
     const { best, n, gap } = info[c.id];
     const dAll = diffOf(c.id, cc)?.all;
-    const sub = [withCup ? esc(c.cup) : "", n ? `${n}件` : "", dAll ? `<span class="diff-mini">${starsText(dAll)}</span>` : ""].filter(Boolean).join("・");
-    return `<button class="row" data-id="${c.id}">
-      ${images[c.id] ? `<img class="thumb" src="${images[c.id]}" alt="">` : ""}
-      <span class="name">${courseLabel(c.name)}${sub ? `<small>${sub}</small>` : ""}</span>
-      <span class="right"><span class="pb ${best ? "" : "none"}">${best ? fmt(best.timeMs) : "—"}</span>
-        ${gap != null ? `<span class="gap ${gap > 0 ? "" : "ok"}">${gapText(gap)}</span>` : ""}</span>
-      <span class="chev">›</span></button>`;
+    const sub = [dAll ? `<span class="diff-mini">${starsText(dAll)}</span>` : "", n ? `${n}件` : ""].filter(Boolean).join(" ");
+    const gapHtml = gap == null ? "" : gap > 0 ? `あと${fmtDiff(gap).slice(1)}` : `達成 ${fmtDiff(gap)}`;
+    return `<button class="tile" data-id="${c.id}">
+      ${images[c.id] ? `<img class="t-img" src="${images[c.id]}" alt="">` : ""}
+      ${withCup ? `<span class="t-cup">${esc(c.cup)}</span>` : ""}
+      <span class="t-name">${courseLabel(c.name)}</span>
+      ${sub ? `<span class="t-sub">${sub}</span>` : ""}
+      <span class="t-pb ${best ? "" : "none"}">${best ? fmt(best.timeMs) : "—"}</span>
+      ${gapRow ? `<span class="t-gap ${gap != null && gap <= 0 ? "ok" : ""}">${gapHtml}</span>` : ""}</button>`;
   };
-  const group = (title, list, withCup) =>
-    list.length ? `<section class="cup"><h2>${title}</h2><div class="list">${list.map((c) => row(c, withCup)).join("")}</div></section>` : "";
+  const group = (title, list, withCup) => {
+    if (!list.length) return "";
+    const gapRow = list.some((c) => info[c.id].gap != null);
+    return `<section class="cup tiles-cup"><h2>${title}</h2><div class="tiles">${list.map((c) => tile(c, withCup, gapRow)).join("")}</div></section>`;
+  };
 
-  let html = `<p class="summary">${cc}cc：${COURSES.length}コース中 ${doneCount}コースに記録あり</p>`;
+  let html = "";
   if (data.settings.sort === "target") {
     // 未達成（あと少しの順）→ 達成済み（目標に近い順）→ 目標か記録がないもの（カップ順）
     const notYet = shown.filter((c) => info[c.id].gap > 0).sort((a, b) => info[a.id].gap - info[b.id].gap);
@@ -471,7 +534,7 @@ function renderHomeList() {
   }
   const $list = document.getElementById("home-list");
   $list.innerHTML = html;
-  $list.querySelectorAll(".row").forEach((r) => r.addEventListener("click", () => go(`#/course/${r.dataset.id}`)));
+  $list.querySelectorAll(".tile").forEach((t) => t.addEventListener("click", () => go(`#/course/${t.dataset.id}`)));
 }
 
 /* ---------- 画面：おまかせ ---------- */
@@ -888,6 +951,9 @@ function renderCourse(courseId) {
     html += `<div class="big none">まだ記録がありません</div>`;
   }
   if (gap != null) html += `<div class="gap-big ${gap > 0 ? "" : "ok"}">${gapText(gap)}</div>`;
+  // 総合得点のうち、このコースの分
+  if (gap != null) html += `<div class="sub">このコースの得点 ${fmtPoints(pointsOf(gap))}点（目標達成で100点・1秒遅いごとに−10点）</div>`;
+  else if (best) html += `<div class="sub">目標タイムを決めると総合得点に入ります</div>`;
   const pbLapGap = best ? lapGapText(best.laps, tLaps) : "";
   if (pbLapGap) html += `<div class="sub lap-gap">ラップの目標との差：${pbLapGap}</div>`;
   html += `</div>`;
