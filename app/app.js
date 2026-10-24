@@ -199,22 +199,129 @@ async function setImage(courseId, dataUrl) {
   else delete images[courseId];
 }
 
-// 選んだ写真を横 640px 以内の JPEG に縮める（そのままだと1枚数 MB になるため）
-function shrinkImage(file) {
+function loadImg(src) {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
     const img = new Image();
-    img.onload = () => {
-      const scale = Math.min(1, 640 / img.naturalWidth);
-      const c = document.createElement("canvas");
-      c.width = Math.round(img.naturalWidth * scale);
-      c.height = Math.round(img.naturalHeight * scale);
-      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-      URL.revokeObjectURL(url);
-      resolve(c.toDataURL("image/jpeg", 0.8));
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("画像を読めません"));
+    img.src = src;
+  });
+}
+
+// 画像の大きさと位置を決める画面。16:9 の枠に見えている部分だけを 640×360 の JPEG（画質 0.8）にして返す。
+// 指1本で動かす・2本指で拡大縮小（スライダーとパソコンのホイールでも）。いちばん小さくて枠いっぱい（すき間は作らない）。
+// やめたら null。src は File か data URL。
+const CROP_W = 640, CROP_H = 360, CROP_MAX = 5;
+
+async function cropImage(src) {
+  const url = typeof src === "string" ? src : URL.createObjectURL(src);
+  let img;
+  try { img = await loadImg(url); } finally { if (url !== src) URL.revokeObjectURL(url); }
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+
+  const $box = document.createElement("div");
+  $box.className = "crop";
+  $box.setAttribute("role", "dialog");
+  $box.setAttribute("aria-label", "画像の大きさと位置");
+  $box.innerHTML = `<div class="crop-in">
+      <p class="crop-title">画像の大きさと位置</p>
+      <div class="crop-frame"></div>
+      <p class="hint">指で動かす・2本指で広げると大きくなります。枠の中だけが保存されます</p>
+      <label class="crop-zoom"><span>小</span><input type="range" min="1" max="${CROP_MAX}" step="0.01" value="1" aria-label="大きさ"><span>大</span></label>
+      <button class="btn primary" data-act="ok">決定</button>
+      <button class="btn" data-act="cancel">やめる</button>
+    </div>`;
+  const $frame = $box.querySelector(".crop-frame");
+  const $zoom = $box.querySelector("input");
+  img.className = "crop-img";
+  img.alt = "";
+  img.draggable = false;
+  $frame.appendChild(img);
+  document.body.appendChild($box);
+
+  // 状態は「枠の真ん中に来る画像上の点（cx, cy：元画像の px）」と「拡大率 z（1＝枠いっぱい）」で持つ。
+  // 枠の大きさが変わっても（画面の回転など）同じ見え方を保てるようにするため。
+  let cx = iw / 2, cy = ih / 2, z = 1;
+  const size = () => ({ W: $frame.clientWidth, H: $frame.clientHeight });
+  const kOf = (W, H, zz) => Math.max(W / iw, H / ih) * zz; // 画面 px ÷ 元画像 px
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  function draw() {
+    const { W, H } = size();
+    const k = kOf(W, H, z);
+    cx = clamp(cx, W / 2 / k, iw - W / 2 / k);
+    cy = clamp(cy, H / 2 / k, ih - H / 2 / k);
+    img.style.width = `${iw * k}px`;
+    img.style.height = `${ih * k}px`;
+    img.style.transform = `translate(${W / 2 - cx * k}px, ${H / 2 - cy * k}px)`;
+    $zoom.value = z;
+  }
+  // 枠の中の点 (mx, my) の下にある画像の点を、拡大率を z2 に変えたあと (mx2, my2) に持ってくる
+  function moveZoom(mx, my, mx2, my2, z2) {
+    const { W, H } = size();
+    const k = kOf(W, H, z);
+    const px = cx + (mx - W / 2) / k, py = cy + (my - H / 2) / k;
+    z = clamp(z2, 1, CROP_MAX);
+    const k2 = kOf(W, H, z);
+    cx = px - (mx2 - W / 2) / k2;
+    cy = py - (my2 - H / 2) / k2;
+    draw();
+  }
+
+  // 指（とマウス）の動き。押している指を全部覚えておき、1本なら移動、2本なら2本の中点と間隔で移動＋拡大縮小
+  const pts = new Map();
+  const local = (e) => { const r = $frame.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+  const gesture = () => {
+    const a = [...pts.values()];
+    if (a.length === 1) return { x: a[0].x, y: a[0].y, d: 0 };
+    return { x: (a[0].x + a[1].x) / 2, y: (a[0].y + a[1].y) / 2, d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) };
+  };
+  $frame.addEventListener("pointerdown", (e) => {
+    if (pts.size >= 2) return;
+    pts.set(e.pointerId, local(e));
+    try { $frame.setPointerCapture(e.pointerId); } catch {} // 枠の外へ指が出ても追い続けるため（できなくても動かせる）
+  });
+  $frame.addEventListener("pointermove", (e) => {
+    if (!pts.has(e.pointerId)) return;
+    const g0 = gesture();
+    pts.set(e.pointerId, local(e));
+    const g1 = gesture();
+    moveZoom(g0.x, g0.y, g1.x, g1.y, g0.d && g1.d ? z * (g1.d / g0.d) : z);
+  });
+  const up = (e) => pts.delete(e.pointerId);
+  $frame.addEventListener("pointerup", up);
+  $frame.addEventListener("pointercancel", up);
+  $frame.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const p = local(e);
+    moveZoom(p.x, p.y, p.x, p.y, z * Math.exp(-e.deltaY / 500));
+  }, { passive: false });
+  $zoom.addEventListener("input", () => {
+    const { W, H } = size();
+    moveZoom(W / 2, H / 2, W / 2, H / 2, Number($zoom.value));
+  });
+  window.addEventListener("resize", draw);
+  draw();
+
+  return new Promise((resolve) => {
+    const close = (result) => {
+      window.removeEventListener("resize", draw);
+      window.removeEventListener("hashchange", onLeave);
+      $box.remove();
+      resolve(result);
     };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("画像を読めません")); };
-    img.src = url;
+    // 「戻る」などで画面が変わったら、やめたことにする
+    const onLeave = () => close(null);
+    window.addEventListener("hashchange", onLeave);
+    $box.querySelector('[data-act="cancel"]').addEventListener("click", () => close(null));
+    $box.querySelector('[data-act="ok"]').addEventListener("click", () => {
+      const { W, H } = size();
+      const k = kOf(W, H, z);
+      const c = document.createElement("canvas");
+      c.width = CROP_W;
+      c.height = CROP_H;
+      c.getContext("2d").drawImage(img, cx - W / 2 / k, cy - H / 2 / k, W / k, H / k, 0, 0, CROP_W, CROP_H);
+      close(c.toDataURL("image/jpeg", 0.8));
+    });
   });
 }
 
@@ -502,10 +609,12 @@ function renderHomeList() {
     const dAll = diffOf(c.id, cc)?.all;
     const sub = [dAll ? `<span class="diff-mini">${starsText(dAll)}</span>` : "", n ? `${n}件` : ""].filter(Boolean).join(" ");
     const gapHtml = gap == null ? "" : gap > 0 ? `あと${fmtDiff(gap).slice(1)}` : `達成 ${fmtDiff(gap)}`;
+    // 画像のあるコースは、画像がコース名の代わり（名前は画像の説明文としてだけ持たせる）
+    const img = images[c.id];
     return `<button class="tile" data-id="${c.id}">
-      ${images[c.id] ? `<img class="t-img" src="${images[c.id]}" alt="">` : ""}
+      ${img ? `<img class="t-img" src="${img}" alt="${esc(c.name)}">` : ""}
       ${withCup ? `<span class="t-cup">${esc(c.cup)}</span>` : ""}
-      <span class="t-name">${courseLabel(c.name)}</span>
+      ${img ? "" : `<span class="t-name">${courseLabel(c.name)}</span>`}
       ${sub ? `<span class="t-sub">${sub}</span>` : ""}
       <span class="t-pb ${best ? "" : "none"}">${best ? fmt(best.timeMs) : "—"}</span>
       ${gapRow ? `<span class="t-gap ${gap != null && gap <= 0 ? "ok" : ""}">${gapHtml}</span>` : ""}</button>`;
@@ -938,7 +1047,7 @@ function renderCourse(courseId) {
 
   let html = images[courseId]
     ? `<div class="course-img"><img src="${images[courseId]}" alt="${esc(course.name)}">
-        <div class="img-btns"><button class="btn small" id="img-pick">画像を変更</button><button class="btn small" id="img-del">画像を外す</button></div></div>`
+        <div class="img-btns"><button class="btn small" id="img-crop">大きさを変える</button><button class="btn small" id="img-pick">画像を変更</button><button class="btn small" id="img-del">画像を外す</button></div></div>`
     : `<button class="img-empty" id="img-pick">＋ コースの画像を選ぶ</button>`;
   html += `<input type="file" id="img-file" accept="image/*" hidden>`;
   html += `<div class="toolbar">${ccSwitch()}</div>`;
@@ -1001,21 +1110,27 @@ function renderCourse(courseId) {
   document.getElementById("add").addEventListener("click", () => go(`#/add/${courseId}`));
   $view.querySelectorAll(".rec").forEach((r) => r.addEventListener("click", () => go(`#/edit/${r.dataset.id}`)));
 
-  // 画像
-  const $file = document.getElementById("img-file");
-  document.getElementById("img-pick").addEventListener("click", () => $file.click());
-  $file.addEventListener("change", async () => {
-    const f = $file.files[0];
-    $file.value = "";
-    if (!f) return;
+  // 画像（選んだら大きさと位置を決める画面を出す。今の画像から決め直すこともできる）
+  const cropAndSave = async (src) => {
     try {
-      await setImage(courseId, await shrinkImage(f));
+      const url = await cropImage(src);
+      if (!url) return;
+      await setImage(courseId, url);
       renderCourse(courseId);
     } catch (e) {
       console.error(e);
       toast("画像を保存できませんでした");
     }
+  };
+  const $file = document.getElementById("img-file");
+  document.getElementById("img-pick").addEventListener("click", () => $file.click());
+  $file.addEventListener("change", () => {
+    const f = $file.files[0];
+    $file.value = "";
+    if (f) cropAndSave(f);
   });
+  const $imgCrop = document.getElementById("img-crop");
+  if ($imgCrop) $imgCrop.addEventListener("click", () => cropAndSave(images[courseId]));
   const $imgDel = document.getElementById("img-del");
   if ($imgDel) $imgDel.addEventListener("click", async () => {
     if (!confirm("このコースの画像を外します。")) return;

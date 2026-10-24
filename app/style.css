@@ -164,6 +164,21 @@ main { padding: 12px 16px 96px; max-width: 640px; margin: 0 auto; }
 .course-img { margin-top: 4px; }
 .course-img img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: var(--radius); }
 .img-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.img-btns .btn.small { padding-left: 10px; padding-right: 10px; }
+/* 画像の大きさと位置を決める画面（画面いっぱいに重ねる） */
+.crop {
+  position: fixed; inset: 0; z-index: 30; overflow-y: auto; touch-action: none;
+  background: var(--bg); padding: calc(env(safe-area-inset-top) + 16px) 16px calc(env(safe-area-inset-bottom) + 16px);
+}
+.crop-in { max-width: 640px; margin: 0 auto; }
+.crop-title { font-weight: 700; text-align: center; margin: 0 0 12px; }
+.crop-frame {
+  position: relative; overflow: hidden; aspect-ratio: 16 / 9; border-radius: var(--radius);
+  background: #000; outline: 2px solid var(--gold); cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none;
+}
+.crop-img { position: absolute; left: 0; top: 0; max-width: none; transform-origin: 0 0; pointer-events: none; }
+.crop-zoom { display: flex; align-items: center; gap: 10px; margin: 10px 2px 4px; color: var(--muted); font-size: 13px; }
+.crop-zoom input { flex: 1; accent-color: var(--gold); }
 .img-empty {
   display: block; width: 100%; margin-top: 4px; padding: 14px; border-radius: var(--radius);
   border: 1px dashed var(--line); background: transparent; color: var(--muted); font-size: 14px;
